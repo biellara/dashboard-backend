@@ -1,9 +1,9 @@
 [project]
 name = "dashboard-sac"
 version = "2026.0.1"
-requires-python = ">=3.0.0, <3.1"
+requires-python = ">=3.11"
 description = "Dashboard para SAC"
-readme = "README.md"  # opcional
+readme = "README.md"
 
 dependencies = [
     "fastapi>=0.129.0",
