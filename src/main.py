@@ -24,17 +24,8 @@ origins = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
     "http://localhost:8000",
+    "https://dashboard-frontend-ten-theta.vercel.app"
 ]
-
-# Adiciona domínio Vercel automaticamente quando em produção
-vercel_url = os.environ.get("VERCEL_URL")
-if vercel_url:
-    origins.append(f"https://{vercel_url}")
-
-# Domínio customizado (se configurado)
-custom_domain = os.environ.get("CUSTOM_DOMAIN")
-if custom_domain:
-    origins.append(f"https://{custom_domain}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,3 +57,4 @@ def read_root():
 def health_check():
     """Endpoint de health check para monitoramento"""
     return {"status": "healthy"}
+    

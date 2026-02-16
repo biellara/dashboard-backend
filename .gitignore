@@ -5,3 +5,5 @@ __init__.py
 *.log
 
 .env
+.vercel
+.env*.local

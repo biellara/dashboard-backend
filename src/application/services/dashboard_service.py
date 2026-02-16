@@ -17,6 +17,7 @@ class DashboardService:
     def __init__(self, db: Session):
         self.db = db
         self.SLA_LIMITE_SEGUNDOS = 300  # 5 minutos
+        self.CSAT_LIMITE = 4.0
     
     def get_total_atendimentos(
         self, 
@@ -40,37 +41,29 @@ class DashboardService:
         
         return query.scalar() or 0
     
-    def get_sla_percentage(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> float:
-        """
-        Retorna o percentual de atendimentos dentro do SLA.
-        SLA = tempo de resposta <= 5 minutos (300 segundos)
-        """
+    def get_sla_percentage(self, data_inicio=None, data_fim=None) -> float:
         query = self.db.query(
             func.count(models.FatoAtendimento.id).label('total'),
             func.sum(
                 case(
-                    (models.FatoAtendimento.tempo_resposta_segundos <= self.SLA_LIMITE_SEGUNDOS, 1),
+                    (models.FatoAtendimento.tempo_espera_segundos <= self.SLA_LIMITE_SEGUNDOS, 1),
                     else_=0
                 )
             ).label('dentro_sla')
         )
-        
+
         if data_inicio:
             query = query.filter(models.FatoAtendimento.data_referencia >= data_inicio)
         if data_fim:
             query = query.filter(models.FatoAtendimento.data_referencia <= data_fim)
-        
+
         result = query.first()
-        
+
         if not result or result.total == 0:
             return 0.0
-        
-        percentual = (result.dentro_sla / result.total) * 100
-        return round(percentual, 1)
+
+        return round((result.dentro_sla / result.total) * 100, 1)
+
     
     def get_tempo_medio_atendimento(
         self,
@@ -92,54 +85,52 @@ class DashboardService:
         result = query.scalar()
         return int(result) if result else 0
     
-    def get_tempo_medio_resposta(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> int:
-        """
-        Retorna o tempo médio de primeira resposta em segundos.
-        """
+    def get_tempo_medio_espera(self, data_inicio=None, data_fim=None) -> int:
         query = self.db.query(
-            func.avg(models.FatoAtendimento.tempo_resposta_segundos)
+            func.avg(models.FatoAtendimento.tempo_espera_segundos)
         )
-        
+
         if data_inicio:
             query = query.filter(models.FatoAtendimento.data_referencia >= data_inicio)
         if data_fim:
             query = query.filter(models.FatoAtendimento.data_referencia <= data_fim)
-        
+
         result = query.scalar()
         return int(result) if result else 0
-    
+
     def get_taxa_satisfacao(
         self,
         data_inicio: Optional[datetime] = None,
         data_fim: Optional[datetime] = None
     ) -> float:
         """
-        Retorna a taxa de satisfação (% de atendimentos satisfeitos).
+        Retorna a taxa de satisfação baseada na nota_atendimento.
+        Considera satisfeito quando nota >= CSAT_LIMITE.
         """
+
         query = self.db.query(
             func.count(models.FatoAtendimento.id).label('total'),
             func.sum(
                 case(
-                    (models.FatoAtendimento.satisfeito == True, 1),
+                    (models.FatoAtendimento.nota_atendimento >= self.CSAT_LIMITE, 1),
                     else_=0
                 )
             ).label('satisfeitos')
         )
-        
+
+        # Ignorar registros sem nota
+        query = query.filter(models.FatoAtendimento.nota_atendimento.isnot(None))
+
         if data_inicio:
             query = query.filter(models.FatoAtendimento.data_referencia >= data_inicio)
         if data_fim:
             query = query.filter(models.FatoAtendimento.data_referencia <= data_fim)
-        
+
         result = query.first()
-        
+
         if not result or result.total == 0:
             return 0.0
-        
+
         taxa = (result.satisfeitos / result.total) * 100
         return round(taxa, 1)
     
@@ -188,7 +179,7 @@ class DashboardService:
             func.avg(models.FatoAtendimento.tempo_atendimento_segundos).label('tempo_medio'),
             func.sum(
                 case(
-                    (models.FatoAtendimento.satisfeito == True, 1),
+                    (models.FatoAtendimento.nota_atendimento >= self.CSAT_LIMITE, 1),
                     else_=0
                 )
             ).label('satisfeitos')
@@ -233,7 +224,7 @@ class DashboardService:
             "total_atendimentos": self.get_total_atendimentos(data_inicio, data_fim),
             "sla_percentual": self.get_sla_percentage(data_inicio, data_fim),
             "tempo_medio_atendimento_segundos": self.get_tempo_medio_atendimento(data_inicio, data_fim),
-            "tempo_medio_resposta_segundos": self.get_tempo_medio_resposta(data_inicio, data_fim),
+            "tempo_medio_resposta_segundos": self.get_tempo_medio_espera(data_inicio, data_fim),
             "taxa_satisfacao": self.get_taxa_satisfacao(data_inicio, data_fim),
             "atendimentos_por_canal": self.get_atendimentos_por_canal(data_inicio, data_fim),
             "ranking_colaboradores": self.get_ranking_colaboradores(data_inicio, data_fim, limite=10)
