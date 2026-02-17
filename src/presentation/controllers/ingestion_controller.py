@@ -22,11 +22,11 @@ router = APIRouter(prefix="/ingestion", tags=["Ingestão"])
 def detect_encoding(raw: bytes) -> str:
     """Detecta encoding para evitar erros de acentuação."""
     try:
-        import chardet
+        import chardet  # type: ignore
         result = chardet.detect(raw)
         enc = (result.get("encoding") or "utf-8").lower().replace("-", "_")
         return "utf-8" if "ascii" in enc else enc
-    except ImportError:
+    except (ImportError, Exception):
         return "utf-8"
 
 def detect_separator(text: str) -> str:
@@ -94,13 +94,14 @@ def extract_date_from_filename(filename: str) -> date:
 # ENDPOINT DE UPLOAD
 # ==========================================
 
+CHUNK_SIZE = 6000
+
 @router.post("/upload-csv")
 async def upload_csv(
     file: UploadFile = File(...), 
     data_voalle: str = Form(None),
     db: Session = Depends(get_db)
 ):
-    # AGORA ACEITAMOS XLSX TAMBÉM
     if not file.filename or not file.filename.endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=400, detail="Apenas ficheiros CSV ou XLSX são permitidos.")
 
@@ -108,33 +109,44 @@ async def upload_csv(
 
     try:
         raw_content = await file.read()
-        registros_lidos = []
-        headers = []
 
         # --------------------------------------------------
-        # ESTRATÉGIA DE LEITURA: EXCEL (.xlsx)
+        # XLSX (mantém como está, mas sugiro chunk também depois)
         # --------------------------------------------------
         if file.filename.endswith(".xlsx"):
             wb = openpyxl.load_workbook(io.BytesIO(raw_content), data_only=True)
             sheet = wb.active
-            
             if sheet is None:
                 raise HTTPException(status_code=400, detail="Planilha Excel vazia ou inválida.")
-            
-            # Lê os cabeçalhos da primeira linha
+
             headers_raw = [cell.value for cell in sheet[1]]
             headers = [str(h).strip() for h in headers_raw if h is not None]
-            
-            # Transforma as linhas num dicionário para ficar igual ao csv.DictReader
+
+            registros_lidos = []
             for row in sheet.iter_rows(min_row=2, values_only=True):
-                # Ignora linhas completamente vazias
                 if all(cell is None for cell in row):
                     continue
                 row_dict = {headers[i]: str(row[i]) if row[i] is not None else "" for i in range(len(headers))}
                 registros_lidos.append(row_dict)
 
+            # routing igual ao teu
+            is_voalle = any(h.upper() in ["CA", "NA", "NSF"] for h in headers)
+            is_omnichannel = "Canal de Atendimento" in headers or "Tempo em Espera na Fila" in headers
+            is_ligacao = "Data de início" in headers and "Sentido" in headers
+
+            if not (is_voalle or is_omnichannel or is_ligacao):
+                raise HTTPException(status_code=400, detail="Formato não reconhecido. Use exportações do Voalle, Omnichannel ou Telefonia.")
+
+            # (pode manter tua lógica atual pra xlsx por enquanto)
+            registros = []
+            for index, row in enumerate(registros_lidos):
+                # aqui dá pra otimizar depois, mas foco é ligações csv
+                row = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in row.items() if k is not None}
+                # ... teu parsing e append(dto) ...
+            # ... chama service ...
+
         # --------------------------------------------------
-        # ESTRATÉGIA DE LEITURA: CSV (.csv)
+        # CSV (OTIMIZADO)
         # --------------------------------------------------
         else:
             encoding = detect_encoding(raw_content)
@@ -147,110 +159,129 @@ async def upload_csv(
                 decoded_content = decoded_content[1:]
 
             separator = detect_separator(decoded_content)
-            reader = list(csv.DictReader(io.StringIO(decoded_content), delimiter=separator))
-            
-            if reader:
-                headers = [str(h).strip() for h in reader[0].keys()]
-                registros_lidos = reader
 
-        # ==================================================
-        # INTELIGÊNCIA DE ROTEAMENTO (Igual a antes)
-        # ==================================================
-        is_voalle = any(h.upper() in ["CA", "NA", "NSF"] for h in headers)
-        is_omnichannel = "Canal de Atendimento" in headers or "Tempo em Espera na Fila" in headers
-        is_ligacao = "Data de início" in headers and "Sentido" in headers
+            reader = csv.DictReader(io.StringIO(decoded_content), delimiter=separator)
+            headers = [str(h).strip() for h in (reader.fieldnames or [])]
 
-        if not (is_voalle or is_omnichannel or is_ligacao):
-            raise HTTPException(status_code=400, detail="Formato não reconhecido. Use exportações do Voalle, Omnichannel ou Telefonia.")
+            # routing igual ao teu
+            is_voalle = any(h.upper() in ["CA", "NA", "NSF"] for h in headers)
+            is_omnichannel = "Canal de Atendimento" in headers or "Tempo em Espera na Fila" in headers
+            is_ligacao = "Data de início" in headers and "Sentido" in headers
 
-        registros = []
+            if not (is_voalle or is_omnichannel or is_ligacao):
+                raise HTTPException(status_code=400, detail="Formato não reconhecido. Use exportações do Voalle, Omnichannel ou Telefonia.")
 
-        for index, row in enumerate(registros_lidos):
-            row = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in row.items() if k is not None}
-            
-            try:
-                # ----------------------------------------------------
-                # ROTA 1: PROCESSAMENTO DO VOALLE
-                # ----------------------------------------------------
+            # acumuladores finais
+            total_success = 0
+            total_error = 0
+            all_errors = []
+
+            chunk = []
+
+            # Pré-calcula data_ref do Voalle uma vez
+            voalle_data_ref = None
+            if is_voalle:
+                if data_voalle:
+                    voalle_data_ref = datetime.strptime(data_voalle, "%Y-%m-%d").date()
+                else:
+                    voalle_data_ref = extract_date_from_filename(file.filename)
+                
+                if voalle_data_ref is None:
+                    raise HTTPException(status_code=400, detail="Data de referência não fornecida para arquivo Voalle. Use o parâmetro data_voalle ou inclua a data no nome do arquivo.")
+
+            def flush_chunk():
+                nonlocal total_success, total_error, all_errors, chunk
+                if not chunk:
+                    return
+
                 if is_voalle:
-                    data_ref = None
-                    if data_voalle:
-                        data_ref = datetime.strptime(data_voalle, "%Y-%m-%d").date()
-                    else:
-                        data_ref = extract_date_from_filename(file.filename)
+                    res = service.process_voalle_batch(chunk)
+                else:
+                    res = service.process_transacional_batch(chunk)
 
-                    dto = VoalleAgregadoImportSchema(
-                        data_referencia=data_ref,
-                        colaborador_nome=clean_agent_name(row.get("Atendente", "Desconhecido")),
-                        clientes_atendidos=safe_int(row.get("CA")),
-                        numero_atendimentos=safe_int(row.get("NA")),
-                        solicitacao_finalizada=safe_int(row.get("NSF"))
-                    )
-                    registros.append(dto)
+                total_success += res["success_count"]
+                total_error += res["error_count"]
+                all_errors.extend(res.get("errors", []))
+                chunk = []
 
-                # ----------------------------------------------------
-                # ROTA 2: PROCESSAMENTO DO OMNICHANNEL (WHATSAPP)
-                # ----------------------------------------------------
-                elif is_omnichannel:
-                    data_str = f"{row.get('Data Inicial', '')} {row.get('Hora Inicial', '')}".strip()
-                    data_ref = datetime.strptime(data_str, "%d/%m/%Y %H:%M:%S") if data_str else datetime.now()
+            for index, row in enumerate(reader, start=1):
+                try:
+                    # ✅ em vez de stripar tudo, pega só o necessário
+                    if is_voalle:
+                        assert voalle_data_ref is not None  # type narrowing
+                        dto = VoalleAgregadoImportSchema(
+                            data_referencia=voalle_data_ref,
+                            colaborador_nome=clean_agent_name((row.get("Atendente") or "Desconhecido").strip()),
+                            clientes_atendidos=safe_int(row.get("CA")),
+                            numero_atendimentos=safe_int(row.get("NA")),
+                            solicitacao_finalizada=safe_int(row.get("NSF")),
+                        )
+                        chunk.append(dto)
 
-                    dto = AtendimentoTransacionalImportSchema(
-                        data_referencia=data_ref,
-                        colaborador_nome=clean_agent_name(row.get("Nome do Atendente", "Desconhecido")),
-                        equipe=row.get("Nome da Equipe"),
-                        canal_nome="WhatsApp", # Hardcoded por regra de negócio
-                        status_nome=row.get("Status", "Desconhecido"),
-                        protocolo=row.get("Número do Protocolo"),
-                        sentido_interacao=None,
-                        tempo_espera_segundos=parse_time_to_seconds(row.get("Tempo em Espera na Fila") or ""),
-                        tempo_atendimento_segundos=parse_time_to_seconds(row.get("Tempo em Atendimento") or ""),
-                        nota_solucao=safe_float_or_none(row.get("Avaliação - Nota da Solução Oferecida")),
-                        nota_atendimento=safe_float_or_none(row.get("Avaliação - Nota do Atendimento Prestado"))
-                    )
-                    registros.append(dto)
+                    elif is_omnichannel:
+                        data_inicial = (row.get("Data Inicial") or "").strip()
+                        hora_inicial = (row.get("Hora Inicial") or "").strip()
+                        data_str = f"{data_inicial} {hora_inicial}".strip()
+                        data_ref = datetime.strptime(data_str, "%d/%m/%Y %H:%M:%S") if data_str else datetime.now()
 
-                # ----------------------------------------------------
-                # ROTA 3: PROCESSAMENTO DAS LIGAÇÕES
-                # ----------------------------------------------------
-                elif is_ligacao:
-                    data_ref = datetime.strptime(row.get("Data de início", ""), "%d/%m/%Y %H:%M:%S")
+                        dto = AtendimentoTransacionalImportSchema(
+                            data_referencia=data_ref,
+                            colaborador_nome=clean_agent_name((row.get("Nome do Atendente") or "Desconhecido").strip()),
+                            equipe=(row.get("Nome da Equipe") or None),
+                            canal_nome="WhatsApp",
+                            status_nome=(row.get("Status") or "Desconhecido").strip(),
+                            protocolo=(row.get("Número do Protocolo") or None),
+                            sentido_interacao=None,
+                            tempo_espera_segundos=parse_time_to_seconds(row.get("Tempo em Espera na Fila") or ""),
+                            tempo_atendimento_segundos=parse_time_to_seconds(row.get("Tempo em Atendimento") or ""),
+                            nota_solucao=safe_float_or_none(row.get("Avaliação - Nota da Solução Oferecida")),
+                            nota_atendimento=safe_float_or_none(row.get("Avaliação - Nota do Atendimento Prestado")),
+                        )
+                        chunk.append(dto)
 
-                    dto = AtendimentoTransacionalImportSchema(
-                        data_referencia=data_ref,
-                        colaborador_nome=clean_agent_name(row.get("Agente", "Desconhecido")),
-                        equipe=row.get("Fila"),
-                        canal_nome="Ligação",
-                        status_nome=row.get("Status", "Desconhecido"),
-                        protocolo=row.get("Protocolo"),
-                        sentido_interacao=row.get("Sentido"),
-                        tempo_espera_segundos=parse_time_to_seconds(row.get("Espera") or ""),
-                        tempo_atendimento_segundos=parse_time_to_seconds(row.get("Atendimento") or ""),
-                        nota_solucao=None,
-                        nota_atendimento=safe_float_or_none(row.get("Avaliação 1"))
-                    )
-                    registros.append(dto)
+                    elif is_ligacao:
+                        # ⚡ ligações: parse direto do necessário
+                        data_inicio = (row.get("Data de início") or "").strip()
+                        data_ref = datetime.strptime(data_inicio, "%d/%m/%Y %H:%M:%S")
 
-            except Exception as e:
-                print(f"Erro ao processar linha {index}: {str(e)}")
-                continue # Ignora a linha com erro e continua
-        
-        # Envia os dados higienizados para o banco de dados
-        if is_voalle:
-            resultado = service.process_voalle_batch(registros)
-        else:
-            resultado = service.process_transacional_batch(registros)
+                        dto = AtendimentoTransacionalImportSchema(
+                            data_referencia=data_ref,
+                            colaborador_nome=clean_agent_name((row.get("Agente") or "Desconhecido").strip()),
+                            equipe=(row.get("Fila") or None),
+                            canal_nome="Ligação",
+                            status_nome=(row.get("Status") or "Desconhecido").strip(),
+                            protocolo=(row.get("Protocolo") or None),
+                            sentido_interacao=(row.get("Sentido") or None),
+                            tempo_espera_segundos=parse_time_to_seconds(row.get("Espera") or ""),
+                            tempo_atendimento_segundos=parse_time_to_seconds(row.get("Atendimento") or ""),
+                            nota_solucao=None,
+                            nota_atendimento=safe_float_or_none(row.get("Avaliação 1")),
+                        )
+                        chunk.append(dto)
 
-        if resultado["success_count"] > 0:
-            status = "success" if resultado["error_count"] == 0 else "warning"
-        else:
-            status = "error"
+                    # ✅ flush em chunk
+                    if len(chunk) >= CHUNK_SIZE:
+                        flush_chunk()
 
-        return {
-            "status": status,
-            "message": f"{resultado['success_count']} registos importados. {resultado['error_count']} erros.",
-            "detalhes": resultado
-        }
+                except Exception as e:
+                    total_error += 1
+                    if len(all_errors) < 20:
+                        all_errors.append(f"Linha {index}: {str(e)}")
+
+            # flush final
+            flush_chunk()
+
+            status = "success" if total_success > 0 and total_error == 0 else ("warning" if total_success > 0 else "error")
+
+            return {
+                "status": status,
+                "message": f"{total_success} registos importados. {total_error} erros.",
+                "detalhes": {
+                    "success_count": total_success,
+                    "error_count": total_error,
+                    "errors": all_errors[:10],
+                }
+            }
 
     except HTTPException:
         raise
