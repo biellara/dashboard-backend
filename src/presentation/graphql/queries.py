@@ -1,215 +1,103 @@
 import strawberry
-from typing import List, Optional, cast
+from typing import List, Optional
 from datetime import datetime
 from src.infrastructure.database.config import SessionLocal
-from src.infrastructure.database import models
 from src.application.services.dashboard_service import DashboardService
 from .schema import (
-    AtendimentoType, 
-    ColaboradorType,
     MetricasConsolidadasType,
     AtendimentoPorCanalType,
-    RankingColaboradorType
+    RankingColaboradorType,
 )
+
 
 @strawberry.type
 class Query:
-    
+
     @strawberry.field
-    def atendimentos(
-        self,
-        limite: int = 100,
-        offset: int = 0,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> List[AtendimentoType]:
-        """
-        Retorna lista de atendimentos com filtros opcionais.
-        """
-        db = SessionLocal()
-        try:
-            query = db.query(models.FatoAtendimento)
-            
-            # Aplicar filtros
-            if data_inicio:
-                query = query.filter(models.FatoAtendimento.data_referencia >= data_inicio)
-            if data_fim:
-                query = query.filter(models.FatoAtendimento.data_referencia <= data_fim)
-            
-            # Ordenar por data mais recente
-            query = query.order_by(models.FatoAtendimento.data_referencia.desc())
-            
-            # Paginação
-            result = query.limit(limite).offset(offset).all()
-            
-            return [
-                AtendimentoType(
-                    id=strawberry.ID(str(a.id)),
-                    data_referencia=cast(datetime, a.data_referencia),
-                    tempo_resposta_segundos=cast(int, a.tempo_resposta_segundos),
-                    tempo_atendimento_segundos=cast(int, a.tempo_atendimento_segundos),
-                    satisfeito=cast(bool, a.satisfeito),
-                    colaborador=ColaboradorType(
-                        id=strawberry.ID(str(a.colaborador.id)),
-                        nome=a.colaborador.nome,
-                        equipe=a.colaborador.equipe
-                    )
-                )
-                for a in result
-            ]
-        finally:
-            db.close()
-    
-    @strawberry.field
-    def kpi_total_atendimentos(
+    def metricas_consolidadas(
         self,
         data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> int:
+        data_fim: Optional[datetime] = None,
+        turno: Optional[str] = None,
+    ) -> MetricasConsolidadasType:
         """
-        Retorna o total de atendimentos no período.
+        Retorna todas as métricas principais em uma única query.
+        Filtros opcionais: data_inicio, data_fim, turno (Madrugada|Manhã|Tarde|Noite)
         """
         db = SessionLocal()
         try:
             service = DashboardService(db)
-            return service.get_total_atendimentos(data_inicio, data_fim)
+            m = service.get_metricas_consolidadas(data_inicio, data_fim, turno)
+
+            return MetricasConsolidadasType(
+                total_atendimentos=m["total_atendimentos"],
+                total_perdidas=m["total_perdidas"],
+                taxa_abandono=m["taxa_abandono"],
+                sla_percentual=m["sla_percentual"],
+                tme_ligacao_segundos=m["tme_ligacao_segundos"],
+                nota_media_ligacao=m["nota_media_ligacao"],
+                tme_omni_segundos=m["tme_omni_segundos"],
+                nota_media_omni=m["nota_media_omni"],
+                atendimentos_por_canal=[
+                    AtendimentoPorCanalType(canal=c["canal"], total=c["total"])
+                    for c in m["atendimentos_por_canal"]
+                ],
+            )
         finally:
             db.close()
-    
-    @strawberry.field
-    def kpi_sla_percentual(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> float:
-        """
-        Retorna o percentual de atendimentos dentro do SLA.
-        """
-        db = SessionLocal()
-        try:
-            service = DashboardService(db)
-            return service.get_sla_percentage(data_inicio, data_fim)
-        finally:
-            db.close()
-    
-    @strawberry.field
-    def kpi_taxa_satisfacao(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> float:
-        """
-        Retorna a taxa de satisfação (%).
-        """
-        db = SessionLocal()
-        try:
-            service = DashboardService(db)
-            return service.get_taxa_satisfacao(data_inicio, data_fim)
-        finally:
-            db.close()
-    
-    @strawberry.field
-    def kpi_tempo_medio_atendimento(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> int:
-        """
-        Retorna o tempo médio de atendimento em segundos.
-        """
-        db = SessionLocal()
-        try:
-            service = DashboardService(db)
-            return service.get_tempo_medio_atendimento(data_inicio, data_fim)
-        finally:
-            db.close()
-    
-    @strawberry.field
-    def atendimentos_por_canal(
-        self,
-        data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> List[AtendimentoPorCanalType]:
-        """
-        Retorna a distribuição de atendimentos por canal.
-        """
-        db = SessionLocal()
-        try:
-            service = DashboardService(db)
-            resultados = service.get_atendimentos_por_canal(data_inicio, data_fim)
-            
-            return [
-                AtendimentoPorCanalType(
-                    canal=r["canal"],
-                    total=r["total"]
-                )
-                for r in resultados
-            ]
-        finally:
-            db.close()
-    
+
     @strawberry.field
     def ranking_colaboradores(
         self,
         data_inicio: Optional[datetime] = None,
         data_fim: Optional[datetime] = None,
-        limite: int = 10
+        turno: Optional[str] = None,
+        limite: int = 50,
     ) -> List[RankingColaboradorType]:
         """
-        Retorna o ranking de colaboradores por volume.
+        Ranking de colaboradores com métricas separadas por canal e Nota Final.
+        Filtros opcionais: data_inicio, data_fim, turno, limite
         """
         db = SessionLocal()
         try:
             service = DashboardService(db)
-            resultados = service.get_ranking_colaboradores(data_inicio, data_fim, limite)
-            
+            resultados = service.get_ranking_colaboradores(data_inicio, data_fim, turno, limite)
+
             return [
                 RankingColaboradorType(
+                    posicao=r["posicao"],
+                    colaborador_id=r["colaborador_id"],
                     nome=r["nome"],
                     equipe=r["equipe"],
+                    turno=r["turno"],
+                    ligacoes_atendidas=r["ligacoes_atendidas"],
+                    ligacoes_perdidas=r["ligacoes_perdidas"],
+                    tme_ligacao_segundos=r["tme_ligacao_segundos"],
+                    nota_ligacao=r["nota_ligacao"],
+                    atendimentos_omni=r["atendimentos_omni"],
+                    tme_omni_segundos=r["tme_omni_segundos"],
+                    nota_omni=r["nota_omni"],
                     total_atendimentos=r["total_atendimentos"],
-                    tempo_medio_segundos=r["tempo_medio_segundos"],
-                    taxa_satisfacao=r["taxa_satisfacao"]
+                    nota_final=r["nota_final"],
                 )
                 for r in resultados
             ]
         finally:
             db.close()
-    
+
     @strawberry.field
-    def metricas_consolidadas(
+    def atendimentos_por_canal(
         self,
         data_inicio: Optional[datetime] = None,
-        data_fim: Optional[datetime] = None
-    ) -> MetricasConsolidadasType:
-        """
-        Retorna todas as métricas principais em uma única query (otimizado).
-        """
+        data_fim: Optional[datetime] = None,
+        turno: Optional[str] = None,
+    ) -> List[AtendimentoPorCanalType]:
         db = SessionLocal()
         try:
             service = DashboardService(db)
-            metricas = service.get_metricas_consolidadas(data_inicio, data_fim)
-            
-            return MetricasConsolidadasType(
-                total_atendimentos=metricas["total_atendimentos"],
-                sla_percentual=metricas["sla_percentual"],
-                tempo_medio_atendimento_segundos=metricas["tempo_medio_atendimento_segundos"],
-                tempo_medio_resposta_segundos=metricas["tempo_medio_resposta_segundos"],
-                taxa_satisfacao=metricas["taxa_satisfacao"],
-                atendimentos_por_canal=[
-                    AtendimentoPorCanalType(canal=c["canal"], total=c["total"])
-                    for c in metricas["atendimentos_por_canal"]
-                ],
-                ranking_colaboradores=[
-                    RankingColaboradorType(
-                        nome=r["nome"],
-                        equipe=r["equipe"],
-                        total_atendimentos=r["total_atendimentos"],
-                        tempo_medio_segundos=r["tempo_medio_segundos"],
-                        taxa_satisfacao=r["taxa_satisfacao"]
-                    )
-                    for r in metricas["ranking_colaboradores"]
-                ]
-            )
+            return [
+                AtendimentoPorCanalType(canal=c["canal"], total=c["total"])
+                for c in service.get_atendimentos_por_canal(data_inicio, data_fim, turno)
+            ]
         finally:
             db.close()

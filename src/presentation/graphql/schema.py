@@ -1,45 +1,71 @@
 import strawberry
-from typing import List
-from datetime import datetime
+from typing import List, Optional
+
+
+# ==========================================
+# TIPOS DE DIMENSÃO
+# ==========================================
 
 @strawberry.type
 class ColaboradorType:
     id: strawberry.ID
     nome: str
-    equipe: str
+    equipe: Optional[str]
+    turno: Optional[str]
 
-@strawberry.type
-class AtendimentoType:
-    id: strawberry.ID
-    data_referencia: datetime
-    tempo_resposta_segundos: int
-    tempo_atendimento_segundos: int
-    satisfeito: bool
-    colaborador: ColaboradorType
 
 @strawberry.type
 class AtendimentoPorCanalType:
     canal: str
     total: int
 
+
+# ==========================================
+# RANKING COLABORADOR (novo — separado por canal)
+# ==========================================
+
 @strawberry.type
 class RankingColaboradorType:
+    posicao: int
+    colaborador_id: int
     nome: str
-    equipe: str
+    equipe: Optional[str]
+    turno: Optional[str]
+
+    # Ligação
+    ligacoes_atendidas: int
+    ligacoes_perdidas: int
+    tme_ligacao_segundos: int
+    nota_ligacao: Optional[float]
+
+    # Omnichannel (WhatsApp)
+    atendimentos_omni: int
+    tme_omni_segundos: int
+    nota_omni: Optional[float]
+
+    # Consolidado
     total_atendimentos: int
-    tempo_medio_segundos: int
-    taxa_satisfacao: float
+    nota_final: Optional[float]
+
+
+# ==========================================
+# MÉTRICAS CONSOLIDADAS (novo)
+# ==========================================
 
 @strawberry.type
 class MetricasConsolidadasType:
-    """
-    Tipo que agrega todas as métricas principais em uma única query.
-    Otimiza o carregamento do dashboard reduzindo round-trips.
-    """
     total_atendimentos: int
+    total_perdidas: int
+    taxa_abandono: float
     sla_percentual: float
-    tempo_medio_atendimento_segundos: int
-    tempo_medio_resposta_segundos: int
-    taxa_satisfacao: float
+
+    # Ligação
+    tme_ligacao_segundos: int
+    nota_media_ligacao: float
+
+    # Omni
+    tme_omni_segundos: int
+    nota_media_omni: float
+
+    # Distribuição
     atendimentos_por_canal: List[AtendimentoPorCanalType]
-    ranking_colaboradores: List[RankingColaboradorType]
