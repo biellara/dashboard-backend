@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
 import csv
 import openpyxl
 import io
@@ -6,6 +7,7 @@ import re
 from datetime import datetime, date
 from sqlalchemy.orm import Session
 from src.infrastructure.database.config import get_db
+from src.infrastructure.database import models
 from src.application.services.ingestion_service import IngestionService
 from src.application.dto.ingestion_schema import (
     AtendimentoTransacionalImportSchema,
@@ -15,6 +17,8 @@ from src.application.dto.ingestion_schema import (
 router = APIRouter(prefix="/ingestion", tags=["Ingestão"])
 
 CHUNK_SIZE = 6000
+
+TURNOS_VALIDOS = ["Madrugada", "Manhã", "Tarde", "Noite"]
 
 
 # ==========================================
@@ -37,10 +41,10 @@ def detect_separator(text: str) -> str:
     return max(candidates, key=lambda k: candidates[k]) if max_count > 0 else ";"
 
 def parse_time_to_seconds(time_str: str) -> int:
-    if not time_str or time_str.strip() in ('-', ''):
+    if not time_str or time_str.strip() in ("-", ""):
         return 0
     try:
-        parts = time_str.strip().split(':')
+        parts = time_str.strip().split(":")
         if len(parts) == 3:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
         elif len(parts) == 2:
@@ -55,7 +59,7 @@ def clean_agent_name(name: str) -> str:
     return name.split(" - ")[0].strip()
 
 def safe_int(value) -> int:
-    if not value or str(value).strip() == '-':
+    if not value or str(value).strip() == "-":
         return 0
     try:
         return int(float(str(value).replace(",", ".").strip()))
@@ -63,7 +67,7 @@ def safe_int(value) -> int:
         return 0
 
 def safe_float_or_none(value) -> float | None:
-    if not value or str(value).strip() == '-':
+    if not value or str(value).strip() == "-":
         return None
     try:
         return float(str(value).replace(",", ".").strip())
@@ -71,12 +75,12 @@ def safe_float_or_none(value) -> float | None:
         return None
 
 def extract_date_from_filename(filename: str) -> date:
-    match = re.search(r'(\d{2,4}[-_]?\d{2}[-_]?\d{2,4})', filename)
+    match = re.search(r"(\d{2,4}[-_]?\d{2}[-_]?\d{2,4})", filename)
     if match:
-        date_str = match.group(1).replace('_', '').replace('-', '')
+        date_str = match.group(1).replace("_", "").replace("-", "")
         try:
             if len(date_str) == 8:
-                if date_str.startswith('20'):
+                if date_str.startswith("20"):
                     return datetime.strptime(date_str, "%Y%m%d").date()
                 else:
                     return datetime.strptime(date_str, "%d%m%Y").date()
@@ -85,16 +89,17 @@ def extract_date_from_filename(filename: str) -> date:
     return date.today()
 
 def detect_format(headers: list[str]):
-    """Detecta o tipo de planilha pelos headers."""
-    is_voalle = any(h.upper() in ["CA", "NA", "NSF"] for h in headers)
-    is_omnichannel = "Canal de Atendimento" in headers or "Tempo em Espera na Fila" in headers
+    """Detecta o tipo de planilha pelos cabeçalhos."""
+    headers_upper = [h.upper() for h in headers]
+    is_voalle_agregado = all(h in headers_upper for h in ["CA", "NA", "NSF"])
+    is_omnichannel = "Nome do Atendente" in headers or "Tempo em Espera na Fila" in headers
     is_ligacao = "Data de início" in headers and "Sentido" in headers
-    return is_voalle, is_omnichannel, is_ligacao
+    return is_voalle_agregado, is_omnichannel, is_ligacao
 
 def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_data_ref=None):
     """Converte uma linha (dict) para o DTO correto."""
     if is_voalle:
-        assert voalle_data_ref is not None  # type narrowing
+        assert voalle_data_ref is not None
         return VoalleAgregadoImportSchema(
             data_referencia=voalle_data_ref,
             colaborador_nome=clean_agent_name((row.get("Atendente") or "Desconhecido").strip()),
@@ -102,6 +107,7 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
             numero_atendimentos=safe_int(row.get("NA")),
             solicitacao_finalizada=safe_int(row.get("NSF")),
         )
+
     elif is_omnichannel:
         data_inicial = (row.get("Data Inicial") or "").strip()
         hora_inicial = (row.get("Hora Inicial") or "").strip()
@@ -120,6 +126,7 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
             nota_solucao=safe_float_or_none(row.get("Avaliação - Nota da Solução Oferecida")),
             nota_atendimento=safe_float_or_none(row.get("Avaliação - Nota do Atendimento Prestado")),
         )
+
     elif is_ligacao:
         data_inicio = (row.get("Data de início") or "").strip()
         data_ref = datetime.strptime(data_inicio, "%d/%m/%Y %H:%M:%S")
@@ -136,11 +143,12 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
             nota_solucao=None,
             nota_atendimento=safe_float_or_none(row.get("Avaliação 1")),
         )
+
     raise ValueError("Formato não reconhecido")
 
 
 # ==========================================
-# ENDPOINT DE UPLOAD
+# ENDPOINT: UPLOAD DE PLANILHA
 # ==========================================
 
 @router.post("/upload-csv")
@@ -150,19 +158,18 @@ async def upload_csv(
     db: Session = Depends(get_db)
 ):
     if not file.filename or not file.filename.endswith((".csv", ".xlsx")):
-        raise HTTPException(status_code=400, detail="Apenas ficheiros CSV ou XLSX são permitidos.")
+        raise HTTPException(status_code=400, detail="Apenas arquivos CSV ou XLSX são permitidos.")
 
     service = IngestionService(db)
 
     try:
         raw_content = await file.read()
-
-        # --------------------------------------------------
-        # Leitura das linhas (CSV ou XLSX → mesmo pipeline)
-        # --------------------------------------------------
         rows: list[dict] = []
         headers: list[str] = []
 
+        # --------------------------------------------------
+        # Leitura (CSV ou XLSX → mesmo pipeline)
+        # --------------------------------------------------
         if file.filename.endswith(".xlsx"):
             wb = openpyxl.load_workbook(io.BytesIO(raw_content), data_only=True, read_only=True)
             sheet = wb.active
@@ -194,7 +201,10 @@ async def upload_csv(
             separator = detect_separator(decoded_content)
             reader = csv.DictReader(io.StringIO(decoded_content), delimiter=separator)
             headers = [str(h).strip() for h in (reader.fieldnames or [])]
-            rows = [{k.strip(): (v.strip() if v else "") for k, v in row.items()} for row in reader]
+            rows = [
+                {k.strip(): (v.strip() if v else "") for k, v in row.items()}
+                for row in reader
+            ]
 
         # --------------------------------------------------
         # Detecção de formato
@@ -217,11 +227,11 @@ async def upload_csv(
             if voalle_data_ref is None:
                 raise HTTPException(
                     status_code=400,
-                    detail="Data de referência não fornecida para arquivo Voalle."
+                    detail="Data de referência não fornecida para arquivo Voalle. Use o parâmetro data_voalle."
                 )
 
         # --------------------------------------------------
-        # Processamento em chunks (mesmo fluxo para CSV e XLSX)
+        # Processamento em chunks
         # --------------------------------------------------
         total_success = 0
         total_error = 0
@@ -251,13 +261,15 @@ async def upload_csv(
 
         flush_chunk()
 
-        status = "success" if total_success > 0 and total_error == 0 else (
-            "warning" if total_success > 0 else "error"
+        status = (
+            "success" if total_success > 0 and total_error == 0
+            else "warning" if total_success > 0
+            else "error"
         )
 
         return {
             "status": status,
-            "message": f"{total_success} registos importados. {total_error} erros.",
+            "message": f"{total_success} registros importados. {total_error} erros.",
             "detalhes": {
                 "success_count": total_success,
                 "error_count": total_error,
@@ -269,3 +281,91 @@ async def upload_csv(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro interno de processamento: {str(e)}")
+
+
+# ==========================================
+# ENDPOINT: ATRIBUIR TURNO AO COLABORADOR
+# ==========================================
+
+class TurnoPayload(BaseModel):
+    nome: str
+    turno: str  # Madrugada | Manhã | Tarde | Noite
+
+@router.patch("/colaborador/turno")
+def atribuir_turno(
+    payload: TurnoPayload,
+    db: Session = Depends(get_db)
+):
+    """
+    Atribui o turno a um colaborador pelo nome.
+    Turnos válidos: Madrugada, Manhã, Tarde, Noite
+    """
+    if payload.turno not in TURNOS_VALIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Turno inválido. Use um dos: {', '.join(TURNOS_VALIDOS)}"
+        )
+
+    colaborador = db.query(models.DimColaborador).filter(
+        models.DimColaborador.nome == payload.nome
+    ).first()
+
+    if not colaborador:
+        raise HTTPException(status_code=404, detail=f"Colaborador '{payload.nome}' não encontrado.")
+
+    colaborador.turno = payload.turno  # type: ignore
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Turno '{payload.turno}' atribuído a '{colaborador.nome}'."
+    }
+
+
+@router.patch("/colaborador/turno/lote")
+def atribuir_turno_lote(
+    payload: list[TurnoPayload],
+    db: Session = Depends(get_db)
+):
+    """
+    Atribui turno a múltiplos colaboradores de uma vez.
+    Útil para configuração inicial.
+    """
+    resultados = []
+    for item in payload:
+        if item.turno not in TURNOS_VALIDOS:
+            resultados.append({"nome": item.nome, "status": "erro", "detalhe": "Turno inválido"})
+            continue
+
+        colaborador = db.query(models.DimColaborador).filter(
+            models.DimColaborador.nome == item.nome
+        ).first()
+
+        if not colaborador:
+            resultados.append({"nome": item.nome, "status": "erro", "detalhe": "Não encontrado"})
+            continue
+
+        colaborador.turno = item.turno  # type: ignore
+        resultados.append({"nome": item.nome, "status": "success", "turno": item.turno})
+
+    db.commit()
+    return {"resultados": resultados}
+
+
+@router.get("/colaboradores")
+def listar_colaboradores(db: Session = Depends(get_db)):
+    """Lista todos os colaboradores com seus turnos. Útil para conferir e atribuir turnos."""
+    colaboradores = db.query(models.DimColaborador).order_by(
+        models.DimColaborador.turno,
+        models.DimColaborador.nome
+    ).all()
+
+    return [
+        {
+            "id": c.id,
+            "nome": c.nome,
+            "equipe": c.equipe,
+            "turno": c.turno or "Não atribuído"
+        }
+        for c in colaboradores
+    ]
