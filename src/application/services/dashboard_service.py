@@ -219,9 +219,6 @@ class DashboardService:
             (lig.c.total_ligacao.isnot(None)) | (omni.c.total_omni.isnot(None))
         )
 
-        if turno:
-            query = query.filter(models.DimColaborador.turno == turno)
-
         results = query.limit(limite).all()
 
         ranking = []
