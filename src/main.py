@@ -1,5 +1,6 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from strawberry.fastapi import GraphQLRouter
 from fastapi.middleware.cors import CORSMiddleware
 import strawberry
@@ -17,7 +18,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS dinâmico — aceita localhost (dev) e domínio Vercel (prod)
+# CORS dinâmico – aceita localhost (dev) e domínio Vercel (prod)
 origins = [
     "http://localhost:5173",
     "http://localhost:3000",
@@ -34,6 +35,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Handler explícito para preflight CORS no GraphQL
+@app.options("/graphql")
+async def graphql_options(request: Request):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
 
 # Rotas REST para Ingestão
 app.include_router(ingestion_controller.router)
@@ -57,4 +71,3 @@ def read_root():
 def health_check():
     """Endpoint de health check para monitoramento"""
     return {"status": "healthy"}
-    
