@@ -17,13 +17,27 @@ from src.application.dto.ingestion_schema import (
 router = APIRouter(prefix="/ingestion", tags=["Ingestão"])
 
 CHUNK_SIZE = 6000
-
 TURNOS_VALIDOS = ["Madrugada", "Manhã", "Tarde", "Noite"]
+
+# Apenas registros deste setor são importados
+SETOR_PERMITIDO = "SAC"
 
 
 # ==========================================
 # FUNÇÕES AUXILIARES
 # ==========================================
+
+def calcular_turno(dt: datetime) -> str:
+    """Calcula o turno com base no horário do atendimento."""
+    hora = dt.hour
+    if 0 <= hora <= 5:
+        return "Madrugada"
+    elif 6 <= hora <= 11:
+        return "Manhã"
+    elif 12 <= hora <= 17:
+        return "Tarde"
+    else:
+        return "Noite"
 
 def detect_encoding(raw: bytes) -> str:
     try:
@@ -89,7 +103,6 @@ def extract_date_from_filename(filename: str) -> date:
     return date.today()
 
 def detect_format(headers: list[str]):
-    """Detecta o tipo de planilha pelos cabeçalhos."""
     headers_upper = [h.upper() for h in headers]
     is_voalle_agregado = all(h in headers_upper for h in ["CA", "NA", "NSF"])
     is_omnichannel = "Nome do Atendente" in headers or "Tempo em Espera na Fila" in headers
@@ -97,8 +110,13 @@ def detect_format(headers: list[str]):
     return is_voalle_agregado, is_omnichannel, is_ligacao
 
 def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_data_ref=None):
-    """Converte uma linha (dict) para o DTO correto."""
+    """
+    Converte uma linha para DTO.
+    Retorna None se o registro não pertencer ao SAC (filtro de setor).
+    """
+
     if is_voalle:
+        # Voalle agregado não tem coluna de setor — importa tudo
         assert voalle_data_ref is not None
         return VoalleAgregadoImportSchema(
             data_referencia=voalle_data_ref,
@@ -109,12 +127,19 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
         )
 
     elif is_omnichannel:
+        # Filtro SAC: coluna "Nome da Equipe"
+        equipe = (row.get("Nome da Equipe") or "").strip().upper()
+        if equipe and equipe != SETOR_PERMITIDO:
+            return None
+
         data_inicial = (row.get("Data Inicial") or "").strip()
         hora_inicial = (row.get("Hora Inicial") or "").strip()
         data_str = f"{data_inicial} {hora_inicial}".strip()
         data_ref = datetime.strptime(data_str, "%d/%m/%Y %H:%M:%S") if data_str else datetime.now()
+
         return AtendimentoTransacionalImportSchema(
             data_referencia=data_ref,
+            turno=calcular_turno(data_ref),
             colaborador_nome=clean_agent_name((row.get("Nome do Atendente") or "Desconhecido").strip()),
             equipe=(row.get("Nome da Equipe") or None),
             canal_nome="WhatsApp",
@@ -128,10 +153,17 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
         )
 
     elif is_ligacao:
+        # Filtro SAC: coluna "Fila"
+        fila = (row.get("Fila") or "").strip().upper()
+        if fila and fila != SETOR_PERMITIDO:
+            return None
+
         data_inicio = (row.get("Data de início") or "").strip()
         data_ref = datetime.strptime(data_inicio, "%d/%m/%Y %H:%M:%S")
+
         return AtendimentoTransacionalImportSchema(
             data_referencia=data_ref,
+            turno=calcular_turno(data_ref),
             colaborador_nome=clean_agent_name((row.get("Agente") or "Desconhecido").strip()),
             equipe=(row.get("Fila") or None),
             canal_nome="Ligação",
@@ -167,9 +199,6 @@ async def upload_csv(
         rows: list[dict] = []
         headers: list[str] = []
 
-        # --------------------------------------------------
-        # Leitura (CSV ou XLSX → mesmo pipeline)
-        # --------------------------------------------------
         if file.filename.endswith(".xlsx"):
             wb = openpyxl.load_workbook(io.BytesIO(raw_content), data_only=True, read_only=True)
             sheet = wb.active
@@ -206,9 +235,6 @@ async def upload_csv(
                 for row in reader
             ]
 
-        # --------------------------------------------------
-        # Detecção de formato
-        # --------------------------------------------------
         is_voalle, is_omnichannel, is_ligacao = detect_format(headers)
 
         if not (is_voalle or is_omnichannel or is_ligacao):
@@ -227,14 +253,12 @@ async def upload_csv(
             if voalle_data_ref is None:
                 raise HTTPException(
                     status_code=400,
-                    detail="Data de referência não fornecida para arquivo Voalle. Use o parâmetro data_voalle."
+                    detail="Data de referência não fornecida para arquivo Voalle."
                 )
 
-        # --------------------------------------------------
-        # Processamento em chunks
-        # --------------------------------------------------
         total_success = 0
         total_error = 0
+        total_ignorados = 0  # registros de outros setores
         all_errors = []
         chunk = []
 
@@ -251,9 +275,16 @@ async def upload_csv(
         for index, row in enumerate(rows, start=1):
             try:
                 dto = parse_row_to_dto(row, is_voalle, is_omnichannel, is_ligacao, voalle_data_ref)
+
+                if dto is None:
+                    # Registro de outro setor — ignora silenciosamente
+                    total_ignorados += 1
+                    continue
+
                 chunk.append(dto)
                 if len(chunk) >= CHUNK_SIZE:
                     flush_chunk()
+
             except Exception as e:
                 total_error += 1
                 if len(all_errors) < 20:
@@ -269,9 +300,10 @@ async def upload_csv(
 
         return {
             "status": status,
-            "message": f"{total_success} registros importados. {total_error} erros.",
+            "message": f"{total_success} registros importados. {total_ignorados} ignorados (outros setores). {total_error} erros.",
             "detalhes": {
                 "success_count": total_success,
+                "ignored_count": total_ignorados,
                 "error_count": total_error,
                 "errors": all_errors[:10],
             }
@@ -284,77 +316,12 @@ async def upload_csv(
 
 
 # ==========================================
-# ENDPOINT: ATRIBUIR TURNO AO COLABORADOR
+# ENDPOINT: LISTAR COLABORADORES
 # ==========================================
-
-class TurnoPayload(BaseModel):
-    nome: str
-    turno: str  # Madrugada | Manhã | Tarde | Noite
-
-@router.patch("/colaborador/turno")
-def atribuir_turno(
-    payload: TurnoPayload,
-    db: Session = Depends(get_db)
-):
-    """
-    Atribui o turno a um colaborador pelo nome.
-    Turnos válidos: Madrugada, Manhã, Tarde, Noite
-    """
-    if payload.turno not in TURNOS_VALIDOS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Turno inválido. Use um dos: {', '.join(TURNOS_VALIDOS)}"
-        )
-
-    colaborador = db.query(models.DimColaborador).filter(
-        models.DimColaborador.nome == payload.nome
-    ).first()
-
-    if not colaborador:
-        raise HTTPException(status_code=404, detail=f"Colaborador '{payload.nome}' não encontrado.")
-
-    colaborador.turno = payload.turno  # type: ignore
-    db.commit()
-
-    return {
-        "status": "success",
-        "message": f"Turno '{payload.turno}' atribuído a '{colaborador.nome}'."
-    }
-
-
-@router.patch("/colaborador/turno/lote")
-def atribuir_turno_lote(
-    payload: list[TurnoPayload],
-    db: Session = Depends(get_db)
-):
-    """
-    Atribui turno a múltiplos colaboradores de uma vez.
-    Útil para configuração inicial.
-    """
-    resultados = []
-    for item in payload:
-        if item.turno not in TURNOS_VALIDOS:
-            resultados.append({"nome": item.nome, "status": "erro", "detalhe": "Turno inválido"})
-            continue
-
-        colaborador = db.query(models.DimColaborador).filter(
-            models.DimColaborador.nome == item.nome
-        ).first()
-
-        if not colaborador:
-            resultados.append({"nome": item.nome, "status": "erro", "detalhe": "Não encontrado"})
-            continue
-
-        colaborador.turno = item.turno  # type: ignore
-        resultados.append({"nome": item.nome, "status": "success", "turno": item.turno})
-
-    db.commit()
-    return {"resultados": resultados}
-
 
 @router.get("/colaboradores")
 def listar_colaboradores(db: Session = Depends(get_db)):
-    """Lista todos os colaboradores com seus turnos. Útil para conferir e atribuir turnos."""
+    """Lista todos os colaboradores com seus turnos predominantes."""
     colaboradores = db.query(models.DimColaborador).order_by(
         models.DimColaborador.turno,
         models.DimColaborador.nome
@@ -365,7 +332,7 @@ def listar_colaboradores(db: Session = Depends(get_db)):
             "id": c.id,
             "nome": c.nome,
             "equipe": c.equipe,
-            "turno": c.turno or "Não atribuído"
+            "turno": c.turno or "Não calculado"
         }
         for c in colaboradores
     ]

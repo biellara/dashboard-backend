@@ -14,7 +14,7 @@ class DimColaborador(Base):
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String, nullable=False)
     equipe = Column(String, nullable=True)
-    turno = Column(String, nullable=True)  # Madrugada | Manhã | Tarde | Noite
+    turno = Column(String, nullable=True)  # Turno predominante (calculado automaticamente)
 
 
 class DimCanal(Base):
@@ -36,11 +36,12 @@ class DimStatus(Base):
 # ==========================================
 
 class FatoAtendimento(Base):
-    """Tabela transacional para Omnichannel (WhatsApp) e Ligações."""
+    """Tabela transacional para Omnichannel (WhatsApp) e Ligações — apenas SAC."""
     __tablename__ = "fato_atendimentos"
 
     id = Column(Integer, primary_key=True, index=True)
     data_referencia = Column(DateTime, nullable=False, index=True)
+    turno = Column(String, nullable=False, index=True)  # Calculado pelo horário do atendimento
 
     protocolo = Column(String(100), nullable=True)
     sentido_interacao = Column(String(50), nullable=True)
@@ -51,12 +52,10 @@ class FatoAtendimento(Base):
     nota_solucao = Column(Numeric(5, 2), nullable=True)
     nota_atendimento = Column(Numeric(5, 2), nullable=True)
 
-    # Chaves Estrangeiras
     colaborador_id = Column(Integer, ForeignKey("dim_colaboradores.id"), nullable=False, index=True)
     canal_id = Column(Integer, ForeignKey("dim_canais.id"), nullable=False, index=True)
     status_id = Column(Integer, ForeignKey("dim_status.id"), nullable=False, index=True)
 
-    # Relacionamentos
     colaborador = relationship("DimColaborador")
     canal = relationship("DimCanal")
     status = relationship("DimStatus")
@@ -73,7 +72,6 @@ class FatoVoalleDiario(Base):
     numero_atendimentos = Column(Integer, nullable=False, default=0)
     solicitacao_finalizada = Column(Integer, nullable=False, default=0)
 
-    # Chave Estrangeira
     colaborador_id = Column(Integer, ForeignKey("dim_colaboradores.id"), nullable=False, index=True)
 
     colaborador = relationship("DimColaborador")

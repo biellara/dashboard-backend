@@ -1,10 +1,16 @@
 """
 Service Layer para Ingestão de Dados — versão otimizada.
+
+Novidades:
+- Campo turno salvo em cada fato_atendimento (calculado pelo horário)
+- Turno predominante do colaborador atualizado automaticamente após cada batch
+- Filtro SAC já aplicado no controller antes de chegar aqui
 """
 
+from typing import Dict, Any
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
-from typing import Optional
 from src.infrastructure.database import models
 from src.application.dto.ingestion_schema import (
     AtendimentoTransacionalImportSchema,
@@ -16,19 +22,18 @@ class IngestionService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _build_dim_cache(self):
-        """Carrega todas as dimensões existentes em memória de uma vez."""
+    # =====================================================
+    # HELPERS DE DIMENSÕES
+    # =====================================================
+
+    def _build_dim_cache(self) -> Dict[str, Dict[str, Any]]:
         return {
-            "colaboradores": {c.nome: c for c in self.db.query(models.DimColaborador).all()},
-            "canais": {c.nome: c for c in self.db.query(models.DimCanal).all()},
-            "status": {s.nome: s for s in self.db.query(models.DimStatus).all()},
+            "colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()},
+            "canais": {str(c.nome): c for c in self.db.query(models.DimCanal).all()},
+            "status": {str(s.nome): s for s in self.db.query(models.DimStatus).all()},
         }
 
     def _flush_new_dims(self, cache, new_colaboradores, new_canais, new_status):
-        """
-        Insere dimensões novas em lote (INSERT ... ON CONFLICT DO NOTHING)
-        e atualiza o cache com os IDs gerados.
-        """
         if new_colaboradores:
             self.db.execute(
                 insert(models.DimColaborador)
@@ -39,7 +44,7 @@ class IngestionService:
             for c in self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
             ).all():
-                cache["colaboradores"][c.nome] = c
+                cache["colaboradores"][str(c.nome)] = c
 
         if new_canais:
             self.db.execute(
@@ -51,7 +56,7 @@ class IngestionService:
             for c in self.db.query(models.DimCanal).filter(
                 models.DimCanal.nome.in_([r["nome"] for r in new_canais])
             ).all():
-                cache["canais"][c.nome] = c
+                cache["canais"][str(c.nome)] = c
 
         if new_status:
             self.db.execute(
@@ -63,7 +68,52 @@ class IngestionService:
             for s in self.db.query(models.DimStatus).filter(
                 models.DimStatus.nome.in_([r["nome"] for r in new_status])
             ).all():
-                cache["status"][s.nome] = s
+                cache["status"][str(s.nome)] = s
+
+    # =====================================================
+    # ATUALIZAÇÃO AUTOMÁTICA DO TURNO DO COLABORADOR
+    # =====================================================
+
+    def _atualizar_turno_colaboradores(self, colaborador_ids: list[int]):
+        """
+        Para cada colaborador_id informado, calcula o turno predominante
+        (o turno com mais atendimentos no histórico) e atualiza dim_colaboradores.
+        Executado em lote após cada commit.
+        """
+        if not colaborador_ids:
+            return
+
+        # Conta atendimentos por colaborador e turno
+        resultado = (
+            self.db.query(
+                models.FatoAtendimento.colaborador_id,
+                models.FatoAtendimento.turno,
+                func.count(models.FatoAtendimento.id).label("total")
+            )
+            .filter(models.FatoAtendimento.colaborador_id.in_(colaborador_ids))
+            .group_by(
+                models.FatoAtendimento.colaborador_id,
+                models.FatoAtendimento.turno
+            )
+            .all()
+        )
+
+        # Agrupa por colaborador e pega o turno de maior contagem
+        turno_por_colaborador: dict[int, tuple[str, int]] = {}
+        for col_id, turno, total in resultado:
+            atual = turno_por_colaborador.get(col_id)
+            if atual is None or total > atual[1]:
+                turno_por_colaborador[col_id] = (turno, total)
+
+        # Atualiza em lote
+        for col_id, (turno, _) in turno_por_colaborador.items():
+            self.db.query(models.DimColaborador).filter(
+                models.DimColaborador.id == col_id
+            ).update({models.DimColaborador.turno: turno}, synchronize_session=False)
+
+    # =====================================================
+    # BATCH TRANSACIONAL (Ligações + Omnichannel)
+    # =====================================================
 
     def process_transacional_batch(
         self,
@@ -76,7 +126,6 @@ class IngestionService:
 
         cache = self._build_dim_cache()
 
-        # Coleta dimensões novas em lote (sem flush por linha)
         new_colaboradores = []
         new_canais = []
         new_status = []
@@ -94,10 +143,10 @@ class IngestionService:
                 if not any(r["nome"] == data.status_nome for r in new_status):
                     new_status.append({"nome": data.status_nome})
 
-        # Um único flush para todas as dimensões novas
         self._flush_new_dims(cache, new_colaboradores, new_canais, new_status)
 
         fatos_para_inserir = []
+        colaborador_ids_afetados = set()
 
         for i, data in enumerate(registros, start=1):
             try:
@@ -110,6 +159,7 @@ class IngestionService:
 
                 fatos_para_inserir.append({
                     "data_referencia": data.data_referencia,
+                    "turno": data.turno,
                     "protocolo": data.protocolo,
                     "sentido_interacao": data.sentido_interacao,
                     "tempo_espera_segundos": data.tempo_espera_segundos,
@@ -121,6 +171,7 @@ class IngestionService:
                     "status_id": status.id,
                 })
 
+                colaborador_ids_afetados.add(colaborador.id)
                 success_count += 1
 
             except Exception as e:
@@ -132,12 +183,20 @@ class IngestionService:
                 self.db.execute(
                     insert(models.FatoAtendimento).values(fatos_para_inserir)
                 )
+
+            # Atualiza turno predominante dos colaboradores afetados
+            self._atualizar_turno_colaboradores(list(colaborador_ids_afetados))
+
             self.db.commit()
         except Exception as e:
             self.db.rollback()
             raise Exception(f"Erro ao inserir lote: {str(e)}")
 
         return {"success_count": success_count, "error_count": error_count, "errors": erros[:10]}
+
+    # =====================================================
+    # BATCH VOALLE (Agregado)
+    # =====================================================
 
     def process_voalle_batch(
         self,
@@ -148,7 +207,7 @@ class IngestionService:
         error_count = 0
         erros = []
 
-        cache = {"colaboradores": {c.nome: c for c in self.db.query(models.DimColaborador).all()}}
+        cache = {"colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()}}
 
         new_colaboradores = []
         for data in registros:
@@ -166,13 +225,13 @@ class IngestionService:
             for c in self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
             ).all():
-                cache["colaboradores"][c.nome] = c
+                cache["colaboradores"][str(c.nome)] = c
 
         fatos_para_inserir = []
 
         for i, data in enumerate(registros, start=1):
             try:
-                colaborador = cache["colaboradores"].get(data.colaborador_nome)  # type: ignore
+                colaborador = cache["colaboradores"].get(data.colaborador_nome)
                 if not colaborador:
                     raise Exception("Colaborador não encontrado.")
 
