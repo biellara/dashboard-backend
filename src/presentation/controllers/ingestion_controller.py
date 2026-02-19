@@ -4,6 +4,7 @@ import csv
 import openpyxl
 import io
 import re
+import unicodedata
 from datetime import datetime, date
 from sqlalchemy.orm import Session
 from src.infrastructure.database.config import get_db
@@ -78,10 +79,35 @@ def parse_time_to_seconds(time_str: str) -> int:
     except Exception:
         return 0
 
+def normalizar_nome(nome: str) -> str:
+    """
+    Normalização canônica de nomes de colaboradores.
+    Remove acentos, converte para maiúsculas e colapsa espaços múltiplos.
+
+    Exemplos:
+        "Ana Carolina Ribeiro Miranda"  → "ANA CAROLINA RIBEIRO MIRANDA"
+        "ANA CAROLINA RIBEIRO MIR..."   → "ANA CAROLINA RIBEIRO MIR..."
+        "Plácido Júnior"               → "PLACIDO JUNIOR"
+        "  joao  da  silva  "          → "JOAO DA SILVA"
+
+    Garantia: dois nomes que representem a mesma pessoa nos diferentes
+    sistemas (telefonia/WhatsApp) sempre resultarão na mesma string,
+    desde que as palavras coincidentes sejam idênticas após normalização.
+    """
+    nfkd = unicodedata.normalize("NFKD", nome)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(sem_acento.upper().split())
+
+
 def clean_agent_name(name: str) -> str:
+    """
+    Remove o sufixo de ramal/extensão (ex: ' - 6373') e normaliza o nome.
+    Retorna 'Desconhecido' para strings vazias (ligações perdidas sem agente).
+    """
     if not name:
         return "Desconhecido"
-    return name.split(" - ")[0].strip()
+    nome_sem_ramal = name.split(" - ")[0].strip()
+    return normalizar_nome(nome_sem_ramal)
 
 def safe_int(value) -> int:
     if not value or str(value).strip() == "-":

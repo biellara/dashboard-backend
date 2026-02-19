@@ -5,6 +5,8 @@ Novidades:
 - Campo turno salvo em cada fato_atendimento (calculado pelo horário)
 - Turno predominante do colaborador atualizado automaticamente após cada batch
 - Filtro SAC já aplicado no controller antes de chegar aqui
+- Cache de colaboradores usa chave normalizada (sem acento, maiúsculo)
+  para garantir que variações do mesmo nome não criem registros duplicados
 """
 
 from typing import Dict, Any
@@ -16,6 +18,17 @@ from src.application.dto.ingestion_schema import (
     AtendimentoTransacionalImportSchema,
     VoalleAgregadoImportSchema
 )
+import unicodedata
+
+
+def normalizar_nome(nome: str) -> str:
+    """
+    Chave canônica de busca: sem acentos, maiúsculo, espaços colapsados.
+    Deve ser idêntica à função homônima no ingestion_controller.py.
+    """
+    nfkd = unicodedata.normalize("NFKD", nome)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(sem_acento.upper().split())
 
 
 class IngestionService:
@@ -28,7 +41,12 @@ class IngestionService:
 
     def _build_dim_cache(self) -> Dict[str, Dict[str, Any]]:
         return {
-            "colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()},
+            # Chave normalizada: garante que "Ana Carolina" e "ANA CAROLINA"
+            # apontem para o mesmo colaborador_id no banco.
+            "colaboradores": {
+                normalizar_nome(str(c.nome)): c
+                for c in self.db.query(models.DimColaborador).all()
+            },
             "canais": {str(c.nome): c for c in self.db.query(models.DimCanal).all()},
             "status": {str(s.nome): s for s in self.db.query(models.DimStatus).all()},
         }
@@ -44,7 +62,8 @@ class IngestionService:
             for c in self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
             ).all():
-                cache["colaboradores"][str(c.nome)] = c
+                # Indexar com chave normalizada para consistência com _build_dim_cache
+                cache["colaboradores"][normalizar_nome(str(c.nome))] = c
 
         if new_canais:
             self.db.execute(
@@ -207,7 +226,12 @@ class IngestionService:
         error_count = 0
         erros = []
 
-        cache = {"colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()}}
+        cache = {
+            "colaboradores": {
+                normalizar_nome(str(c.nome)): c
+                for c in self.db.query(models.DimColaborador).all()
+            }
+        }
 
         new_colaboradores = []
         for data in registros:
@@ -225,7 +249,7 @@ class IngestionService:
             for c in self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
             ).all():
-                cache["colaboradores"][str(c.nome)] = c
+                cache["colaboradores"][normalizar_nome(str(c.nome))] = c
 
         fatos_para_inserir = []
 
