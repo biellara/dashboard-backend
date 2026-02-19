@@ -40,6 +40,17 @@ def calcular_turno(dt: datetime) -> str:
         return "Noite"
 
 def detect_encoding(raw: bytes) -> str:
+    """
+    Tenta UTF-8 primeiro (com e sem BOM).
+    Só recorre ao chardet se UTF-8 realmente falhar.
+    Evita falsos positivos de MacRoman/Latin-1 em arquivos UTF-8.
+    """
+    sample = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+    try:
+        sample.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
     try:
         import chardet  # type: ignore
         result = chardet.detect(raw)
@@ -294,13 +305,12 @@ async def upload_csv(
                     continue
 
                 # Deduplicação por protocolo dentro do mesmo upload
-                if not is_voalle and hasattr(dto, "protocolo"):
-                    protocolo = getattr(dto, "protocolo", None)
-                    if protocolo:
-                        if protocolo in protocolos_vistos:
-                            total_duplicados += 1
-                            continue
-                        protocolos_vistos.add(protocolo)
+                protocolo_val: str | None = getattr(dto, "protocolo", None)
+                if protocolo_val:
+                    if protocolo_val in protocolos_vistos:
+                        total_duplicados += 1
+                        continue
+                    protocolos_vistos.add(protocolo_val)
 
                 chunk.append(dto)
                 if len(chunk) >= CHUNK_SIZE:
