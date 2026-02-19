@@ -1,6 +1,10 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Date, Numeric
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Date, Numeric, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.ext.declarative import declarative_base
+import uuid
+from datetime import datetime
+from typing import Optional
 
 Base = declarative_base()
 
@@ -75,3 +79,18 @@ class FatoVoalleDiario(Base):
     colaborador_id = Column(Integer, ForeignKey("dim_colaboradores.id"), nullable=False, index=True)
 
     colaborador = relationship("DimColaborador")
+
+# ==========================================
+# AUDITORIA DE UPLOADS
+# ==========================================
+
+class Upload(Base):
+    """Registro de cada arquivo importado — permite auditoria e diagnóstico."""
+    __tablename__ = "uploads"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[Optional[str]] = mapped_column(String, default="pending")
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

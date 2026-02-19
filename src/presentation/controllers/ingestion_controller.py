@@ -213,6 +213,15 @@ async def upload_csv(
 
     service = IngestionService(db)
 
+    # Registra o upload imediatamente (status=pending) para auditoria
+    upload_record = models.Upload(
+        file_path=file.filename,
+        status="pending",
+        created_at=datetime.utcnow(),
+    )
+    db.add(upload_record)
+    db.commit()
+
     try:
         raw_content = await file.read()
         rows: list[dict] = []
@@ -337,6 +346,12 @@ async def upload_csv(
         if total_error:
             partes_msg.append(f"{total_error} erros")
 
+        upload_record.status = status
+        upload_record.processed_at = datetime.utcnow()
+        if all_errors:
+            upload_record.error = "; ".join(all_errors[:5])
+        db.commit()
+
         return {
             "status": status,
             "message": ". ".join(partes_msg) + ".",
@@ -350,8 +365,15 @@ async def upload_csv(
         }
 
     except HTTPException:
+        upload_record.status = "error"
+        upload_record.processed_at = datetime.utcnow()
+        db.commit()
         raise
     except Exception as e:
+        upload_record.status = "error"
+        upload_record.processed_at = datetime.utcnow()
+        upload_record.error = str(e)
+        db.commit()
         raise HTTPException(status_code=500, detail=f"Erro interno de processamento: {str(e)}")
 
 
