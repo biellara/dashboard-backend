@@ -121,7 +121,9 @@ def safe_float_or_none(value) -> float | None:
     if not value or str(value).strip() == "-":
         return None
     try:
-        return float(str(value).replace(",", ".").strip())
+        val = float(str(value).replace(",", ".").strip())
+        # NUMERIC(5,2) suporta valores de -999.99 a 999.99
+        return max(-999.99, min(999.99, val))
     except ValueError:
         return None
 
