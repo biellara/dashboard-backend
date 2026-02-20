@@ -36,14 +36,14 @@ class RankingColaboradorType:
     # Ligação
     ligacoes_atendidas: int
     ligacoes_perdidas: int
-    tme_ligacao_segundos: int   # Tempo Médio de Espera (fila)
-    tma_ligacao_segundos: int   # Tempo Médio de Atendimento (conversa) — NOVO
+    tme_ligacao_segundos: int
+    tma_ligacao_segundos: int
     nota_ligacao: Optional[float]
 
     # Omnichannel (WhatsApp)
     atendimentos_omni: int
-    tme_omni_segundos: int      # Tempo Médio de Espera (fila)
-    tma_omni_segundos: int      # Tempo Médio de Atendimento (conversa) — NOVO
+    tme_omni_segundos: int
+    tma_omni_segundos: int
     nota_omni: Optional[float]
 
     # Voalle (produtividade ISP)
@@ -69,22 +69,34 @@ class MetricasConsolidadasType:
     sla_percentual: float
 
     # Ligação
-    tme_ligacao_segundos: int   # Tempo Médio de Espera (fila)
-    tma_ligacao_segundos: int   # Tempo Médio de Atendimento (conversa) — NOVO
+    tme_ligacao_segundos: int
+    tma_ligacao_segundos: int
     nota_media_ligacao: float
 
     # Omni
-    tme_omni_segundos: int      # Tempo Médio de Espera (fila)
-    tma_omni_segundos: int      # Tempo Médio de Atendimento (conversa) — NOVO
+    tme_omni_segundos: int
+    tma_omni_segundos: int
     nota_media_omni: float
-    nota_media_solucao_omni: float  # Nota da solução (separada do atendente) — NOVO
+    nota_media_solucao_omni: float
 
     # Distribuição
     atendimentos_por_canal: List[AtendimentoPorCanalType]
 
 
 # ==========================================
-# VOALLE DIÁRIO — NOVO
+# ÚLTIMA ATUALIZAÇÃO POR FONTE — NOVO
+# ==========================================
+
+@strawberry.type
+class UltimaAtualizacaoType:
+    """Data/hora do registro mais recente de cada fonte de dados."""
+    omni: Optional[str]
+    ligacao: Optional[str]
+    voalle: Optional[str]
+
+
+# ==========================================
+# VOALLE DIÁRIO
 # ==========================================
 
 @strawberry.type
@@ -105,12 +117,12 @@ class ResumoVoalleType:
     total_clientes_atendidos: int
     total_atendimentos: int
     total_finalizados: int
-    taxa_finalizacao: float          # (total_finalizados / total_atendimentos) * 100
+    taxa_finalizacao: float
     registros: List[VoalleDiarioType]
 
 
 # ==========================================
-# HISTÓRICO DE UPLOADS — NOVO
+# HISTÓRICO DE UPLOADS
 # ==========================================
 
 @strawberry.type
