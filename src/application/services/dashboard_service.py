@@ -200,7 +200,7 @@ class DashboardService:
             func.count(models.FatoAtendimento.id).label("total_ligacao"),
             func.sum(case((models.DimStatus.nome == "Perdida", 1), else_=0)).label("total_perdida"),
             func.avg(models.FatoAtendimento.tempo_espera_segundos).label("tme_ligacao"),
-            func.avg(case(                                                          # TMA — NOVO
+            func.avg(case(
                 (models.FatoAtendimento.tempo_atendimento_segundos > 0,
                  models.FatoAtendimento.tempo_atendimento_segundos),
                 else_=None
@@ -229,7 +229,7 @@ class DashboardService:
             models.FatoAtendimento.colaborador_id.label("col_id"),
             func.count(models.FatoAtendimento.id).label("total_omni"),
             func.avg(models.FatoAtendimento.tempo_espera_segundos).label("tme_omni"),
-            func.avg(case(                                                          # TMA — NOVO
+            func.avg(case(
                 (models.FatoAtendimento.tempo_atendimento_segundos > 0,
                  models.FatoAtendimento.tempo_atendimento_segundos),
                 else_=None
@@ -255,7 +255,22 @@ class DashboardService:
 
         omni = omni.group_by(models.FatoAtendimento.colaborador_id).subquery()
 
-        # Query principal
+        # Sub-query Voalle — produtividade ISP, sem filtro de turno
+        voalle = self.db.query(
+            models.FatoVoalleDiario.colaborador_id.label("col_id"),
+            func.sum(models.FatoVoalleDiario.clientes_atendidos).label("voalle_clientes"),
+            func.sum(models.FatoVoalleDiario.numero_atendimentos).label("voalle_atendimentos"),
+            func.sum(models.FatoVoalleDiario.solicitacao_finalizada).label("voalle_finalizados"),
+        )
+
+        if data_inicio:
+            voalle = voalle.filter(models.FatoVoalleDiario.data_referencia >= data_inicio)
+        if data_fim:
+            voalle = voalle.filter(models.FatoVoalleDiario.data_referencia <= data_fim)
+
+        voalle = voalle.group_by(models.FatoVoalleDiario.colaborador_id).subquery()
+
+        # Query principal — apenas colaboradores SAC
         query = self.db.query(
             models.DimColaborador.id,
             models.DimColaborador.nome,
@@ -270,12 +285,20 @@ class DashboardService:
             omni.c.tme_omni,
             omni.c.tma_omni,
             omni.c.nota_omni,
+            voalle.c.voalle_clientes,
+            voalle.c.voalle_atendimentos,
+            voalle.c.voalle_finalizados,
         ).outerjoin(
             lig, models.DimColaborador.id == lig.c.col_id
         ).outerjoin(
             omni, models.DimColaborador.id == omni.c.col_id
+        ).outerjoin(
+            voalle, models.DimColaborador.id == voalle.c.col_id
         ).filter(
-            (lig.c.total_ligacao.isnot(None)) | (omni.c.total_omni.isnot(None))
+            models.DimColaborador.equipe == "SAC",
+            (lig.c.total_ligacao.isnot(None))
+            | (omni.c.total_omni.isnot(None))
+            | (voalle.c.voalle_atendimentos.isnot(None))
         )
 
         results = query.limit(limite).all()
@@ -289,6 +312,7 @@ class DashboardService:
             nota_ligacao = round(float(r.nota_ligacao), 2) if r.nota_ligacao else None
             nota_omni = round(float(r.nota_omni), 2) if r.nota_omni else None
 
+            # Nota final ponderada pelo volume de atendimentos
             nota_final = None
             if nota_ligacao is not None and nota_omni is not None:
                 total_vol = ligacoes_atendidas + total_omni
@@ -301,20 +325,31 @@ class DashboardService:
             elif nota_omni is not None:
                 nota_final = nota_omni
 
+            voalle_atend = int(r.voalle_atendimentos or 0)
+            voalle_final = int(r.voalle_finalizados or 0)
+
             ranking.append({
                 "colaborador_id": r.id,
                 "nome": r.nome,
                 "equipe": r.equipe,
                 "turno": r.turno,
+                # Ligação
                 "ligacoes_atendidas": ligacoes_atendidas,
                 "ligacoes_perdidas": total_perdida,
                 "tme_ligacao_segundos": int(r.tme_ligacao) if r.tme_ligacao else 0,
                 "tma_ligacao_segundos": int(r.tma_ligacao) if r.tma_ligacao else 0,
                 "nota_ligacao": nota_ligacao,
+                # Omnichannel
                 "atendimentos_omni": total_omni,
                 "tme_omni_segundos": int(r.tme_omni) if r.tme_omni else 0,
                 "tma_omni_segundos": int(r.tma_omni) if r.tma_omni else 0,
                 "nota_omni": nota_omni,
+                # Voalle (produtividade ISP)
+                "voalle_clientes_atendidos": int(r.voalle_clientes or 0),
+                "voalle_atendimentos": voalle_atend,
+                "voalle_finalizados": voalle_final,
+                "voalle_taxa_finalizacao": round((voalle_final / voalle_atend) * 100, 1) if voalle_atend > 0 else None,
+                # Consolidado
                 "total_atendimentos": ligacoes_atendidas + total_omni,
                 "nota_final": nota_final,
             })
