@@ -1,10 +1,13 @@
 """
-Service Layer para Ingestão de Dados — versão otimizada.
+Service Layer para Ingestão de Dados.
 
-Novidades:
-- Campo turno salvo em cada fato_atendimento (calculado pelo horário)
-- Turno predominante do colaborador atualizado automaticamente após cada batch
-- Filtro SAC já aplicado no controller antes de chegar aqui
+Fluxo de resolução de nomes:
+  1. resolver_nome() normaliza e mapeia qualquer variação ao nome canônico
+     (ex: "PLÁCIDO JÚNIOR", "Placido Portal De Sousa Junior" → "PLACIDO JUNIOR")
+  2. O cache de colaboradores é indexado pelo nome canônico
+  3. Se o canônico não existe no banco, é criado automaticamente
+  4. No Voalle: apenas colaboradores com equipe='SAC' são importados
+     (o Voalle não tem coluna de setor — o filtro é feito pelo cache)
 """
 
 from typing import Dict, Any
@@ -14,8 +17,9 @@ from sqlalchemy.dialects.postgresql import insert
 from src.infrastructure.database import models
 from src.application.dto.ingestion_schema import (
     AtendimentoTransacionalImportSchema,
-    VoalleAgregadoImportSchema
+    VoalleAgregadoImportSchema,
 )
+from src.shared.utils.name_resolver import resolver_nome, is_sac
 
 
 class IngestionService:
@@ -26,11 +30,22 @@ class IngestionService:
     # HELPERS DE DIMENSÕES
     # =====================================================
 
-    def _build_dim_cache(self) -> Dict[str, Dict[str, Any]]:
+    def _build_dim_cache(self) -> Dict[str, Any]:
+        """
+        Cache indexado pelo nome canônico normalizado.
+        resolver_nome() garante que qualquer variação chegue à chave correta.
+        """
         return {
-            "colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()},
-            "canais": {str(c.nome): c for c in self.db.query(models.DimCanal).all()},
-            "status": {str(s.nome): s for s in self.db.query(models.DimStatus).all()},
+            "colaboradores": {
+                resolver_nome(str(c.nome)): c
+                for c in self.db.query(models.DimColaborador).all()
+            },
+            "canais": {
+                str(c.nome): c for c in self.db.query(models.DimCanal).all()
+            },
+            "status": {
+                str(s.nome): s for s in self.db.query(models.DimStatus).all()
+            },
         }
 
     def _flush_new_dims(self, cache, new_colaboradores, new_canais, new_status):
@@ -44,7 +59,7 @@ class IngestionService:
             for c in self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
             ).all():
-                cache["colaboradores"][str(c.nome)] = c
+                cache["colaboradores"][resolver_nome(str(c.nome))] = c
 
         if new_canais:
             self.db.execute(
@@ -75,37 +90,29 @@ class IngestionService:
     # =====================================================
 
     def _atualizar_turno_colaboradores(self, colaborador_ids: list[int]):
-        """
-        Para cada colaborador_id informado, calcula o turno predominante
-        (o turno com mais atendimentos no histórico) e atualiza dim_colaboradores.
-        Executado em lote após cada commit.
-        """
         if not colaborador_ids:
             return
 
-        # Conta atendimentos por colaborador e turno
         resultado = (
             self.db.query(
                 models.FatoAtendimento.colaborador_id,
                 models.FatoAtendimento.turno,
-                func.count(models.FatoAtendimento.id).label("total")
+                func.count(models.FatoAtendimento.id).label("total"),
             )
             .filter(models.FatoAtendimento.colaborador_id.in_(colaborador_ids))
             .group_by(
                 models.FatoAtendimento.colaborador_id,
-                models.FatoAtendimento.turno
+                models.FatoAtendimento.turno,
             )
             .all()
         )
 
-        # Agrupa por colaborador e pega o turno de maior contagem
         turno_por_colaborador: dict[int, tuple[str, int]] = {}
         for col_id, turno, total in resultado:
             atual = turno_por_colaborador.get(col_id)
             if atual is None or total > atual[1]:
                 turno_por_colaborador[col_id] = (turno, total)
 
-        # Atualiza em lote
         for col_id, (turno, _) in turno_por_colaborador.items():
             self.db.query(models.DimColaborador).filter(
                 models.DimColaborador.id == col_id
@@ -113,27 +120,35 @@ class IngestionService:
 
     # =====================================================
     # BATCH TRANSACIONAL (Ligações + Omnichannel)
+    # Filtro SAC aplicado no ingestion_controller antes de chegar aqui.
     # =====================================================
 
     def process_transacional_batch(
         self,
-        registros: list[AtendimentoTransacionalImportSchema]
+        registros: list[AtendimentoTransacionalImportSchema],
     ) -> dict:
 
         success_count = 0
         error_count = 0
-        erros = []
+        erros: list[str] = []
+        nomes_sem_match: list[str] = []
 
         cache = self._build_dim_cache()
-
-        new_colaboradores = []
-        new_canais = []
-        new_status = []
+        new_colaboradores: list[dict] = []
+        new_canais: list[dict] = []
+        new_status: list[dict] = []
 
         for data in registros:
-            if data.colaborador_nome not in cache["colaboradores"]:
-                if not any(r["nome"] == data.colaborador_nome for r in new_colaboradores):
-                    new_colaboradores.append({"nome": data.colaborador_nome, "equipe": data.equipe})
+            nome_key = resolver_nome(data.colaborador_nome)
+
+            if nome_key not in cache["colaboradores"]:
+                if data.colaborador_nome not in nomes_sem_match:
+                    nomes_sem_match.append(data.colaborador_nome)
+                if not any(resolver_nome(r["nome"]) == nome_key for r in new_colaboradores):
+                    new_colaboradores.append({
+                        "nome": nome_key.title(),
+                        "equipe": data.equipe or "SAC",
+                    })
 
             if data.canal_nome not in cache["canais"]:
                 if not any(r["nome"] == data.canal_nome for r in new_canais):
@@ -145,17 +160,17 @@ class IngestionService:
 
         self._flush_new_dims(cache, new_colaboradores, new_canais, new_status)
 
-        fatos_para_inserir = []
-        colaborador_ids_afetados = set()
+        fatos_para_inserir: list[dict] = []
+        colaborador_ids_afetados: set[int] = set()
 
         for i, data in enumerate(registros, start=1):
             try:
-                colaborador = cache["colaboradores"].get(data.colaborador_nome)
+                colaborador = cache["colaboradores"].get(resolver_nome(data.colaborador_nome))
                 canal = cache["canais"].get(data.canal_nome)
                 status = cache["status"].get(data.status_nome)
 
                 if not colaborador or not canal or not status:
-                    raise Exception("Dimensão não encontrada no cache após inserção.")
+                    raise ValueError("Dimensão não encontrada no cache após inserção.")
 
                 fatos_para_inserir.append({
                     "data_referencia": data.data_referencia,
@@ -183,58 +198,93 @@ class IngestionService:
                 self.db.execute(
                     insert(models.FatoAtendimento).values(fatos_para_inserir)
                 )
-
-            # Atualiza turno predominante dos colaboradores afetados
             self._atualizar_turno_colaboradores(list(colaborador_ids_afetados))
-
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            raise Exception(f"Erro ao inserir lote: {str(e)}")
+            raise RuntimeError(f"Erro ao inserir lote: {str(e)}") from e
 
-        return {"success_count": success_count, "error_count": error_count, "errors": erros[:10]}
+        return {
+            "success_count": success_count,
+            "error_count": error_count,
+            "errors": erros[:10],
+            # Nomes que não constam no name_resolver — novo colaborador SAC
+            # ou variação ainda não mapeada. Adicionar em name_resolver.py se necessário.
+            "nomes_sem_match": nomes_sem_match,
+        }
 
     # =====================================================
     # BATCH VOALLE (Agregado)
+    # O Voalle não tem coluna de setor. Estratégia:
+    #   - is_sac() verifica se o nome pertence a um colaborador SAC do resolver
+    #   - Nomes fora do resolver SAC são ignorados silenciosamente
     # =====================================================
 
     def process_voalle_batch(
         self,
-        registros: list[VoalleAgregadoImportSchema]
+        registros: list[VoalleAgregadoImportSchema],
     ) -> dict:
 
         success_count = 0
         error_count = 0
-        erros = []
+        ignorados_count = 0
+        erros: list[str] = []
+        nomes_ignorados: list[str] = []
 
-        cache = {"colaboradores": {str(c.nome): c for c in self.db.query(models.DimColaborador).all()}}
+        # Cache apenas com colaboradores SAC já cadastrados no banco
+        cache_colaboradores: Dict[str, Any] = {
+            resolver_nome(str(c.nome)): c
+            for c in self.db.query(models.DimColaborador)
+                            .filter(models.DimColaborador.equipe == "SAC")
+                            .all()
+        }
 
-        new_colaboradores = []
-        for data in registros:
-            if data.colaborador_nome not in cache["colaboradores"]:
-                if not any(r["nome"] == data.colaborador_nome for r in new_colaboradores):
-                    new_colaboradores.append({"nome": data.colaborador_nome, "equipe": None})
-
-        if new_colaboradores:
-            self.db.execute(
-                insert(models.DimColaborador)
-                .values(new_colaboradores)
-                .on_conflict_do_nothing()
-            )
-            self.db.flush()
-            for c in self.db.query(models.DimColaborador).filter(
-                models.DimColaborador.nome.in_([r["nome"] for r in new_colaboradores])
-            ).all():
-                cache["colaboradores"][str(c.nome)] = c
-
-        fatos_para_inserir = []
+        fatos_para_inserir: list[dict] = []
 
         for i, data in enumerate(registros, start=1):
-            try:
-                colaborador = cache["colaboradores"].get(data.colaborador_nome)
-                if not colaborador:
-                    raise Exception("Colaborador não encontrado.")
+            nome_raw: str = data.colaborador_nome
 
+            # Ignora entradas de sistema (bots, totais)
+            if any(skip in nome_raw.upper() for skip in ("SYNTESIS", "TOTAL GERAL", "OLIVIA BOT")):
+                ignorados_count += 1
+                continue
+
+            # Ignora colaboradores que não são SAC (não constam no resolver SAC)
+            if not is_sac(nome_raw):
+                nomes_ignorados.append(nome_raw)
+                ignorados_count += 1
+                continue
+
+            nome_key = resolver_nome(nome_raw)
+            colaborador = cache_colaboradores.get(nome_key)
+
+            # SAC confirmado mas ainda não no banco — cria agora
+            if not colaborador:
+                try:
+                    self.db.execute(
+                        insert(models.DimColaborador)
+                        .values({"nome": nome_key.title(), "equipe": "SAC"})
+                        .on_conflict_do_nothing()
+                    )
+                    self.db.flush()
+                    colaborador = (
+                        self.db.query(models.DimColaborador)
+                        .filter(models.DimColaborador.nome == nome_key.title())
+                        .first()
+                    )
+                    if colaborador:
+                        cache_colaboradores[nome_key] = colaborador
+                except Exception as e:
+                    error_count += 1
+                    erros.append(f"Linha {i} (criar colaborador): {str(e)}")
+                    continue
+
+            if not colaborador:
+                error_count += 1
+                erros.append(f"Linha {i}: colaborador nao pode ser criado.")
+                continue
+
+            try:
                 fatos_para_inserir.append({
                     "data_referencia": data.data_referencia,
                     "clientes_atendidos": data.clientes_atendidos,
@@ -242,7 +292,6 @@ class IngestionService:
                     "solicitacao_finalizada": data.solicitacao_finalizada,
                     "colaborador_id": colaborador.id,
                 })
-
                 success_count += 1
 
             except Exception as e:
@@ -257,6 +306,13 @@ class IngestionService:
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            raise Exception(f"Erro ao inserir lote Voalle: {str(e)}")
+            raise RuntimeError(f"Erro ao inserir lote Voalle: {str(e)}") from e
 
-        return {"success_count": success_count, "error_count": error_count, "errors": erros[:10]}
+        return {
+            "success_count": success_count,
+            "error_count": error_count,
+            "ignorados_count": ignorados_count,
+            "errors": erros[:10],
+            # Nomes do Voalle que não são SAC — outros setores, ignorados normalmente
+            "nomes_ignorados": nomes_ignorados,
+        }

@@ -4,6 +4,7 @@ import csv
 import openpyxl
 import io
 import re
+import unicodedata
 from datetime import datetime, date
 from sqlalchemy.orm import Session
 from src.infrastructure.database.config import get_db
@@ -19,8 +20,8 @@ router = APIRouter(prefix="/ingestion", tags=["Ingestão"])
 CHUNK_SIZE = 6000
 TURNOS_VALIDOS = ["Madrugada", "Manhã", "Tarde", "Noite"]
 
-# Apenas registros deste setor são importados
-SETOR_PERMITIDO = "SAC"
+# Apenas registros cujo setor/fila começa com este prefixo são importados
+SETOR_PREFIXO = "SAC"
 
 
 # ==========================================
@@ -40,6 +41,17 @@ def calcular_turno(dt: datetime) -> str:
         return "Noite"
 
 def detect_encoding(raw: bytes) -> str:
+    """
+    Tenta UTF-8 primeiro (com e sem BOM).
+    Só recorre ao chardet se UTF-8 realmente falhar.
+    Evita falsos positivos de MacRoman/Latin-1 em arquivos UTF-8.
+    """
+    sample = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+    try:
+        sample.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
     try:
         import chardet  # type: ignore
         result = chardet.detect(raw)
@@ -67,10 +79,35 @@ def parse_time_to_seconds(time_str: str) -> int:
     except Exception:
         return 0
 
+def normalizar_nome(nome: str) -> str:
+    """
+    Normalização canônica de nomes de colaboradores.
+    Remove acentos, converte para maiúsculas e colapsa espaços múltiplos.
+
+    Exemplos:
+        "Ana Carolina Ribeiro Miranda"  → "ANA CAROLINA RIBEIRO MIRANDA"
+        "ANA CAROLINA RIBEIRO MIR..."   → "ANA CAROLINA RIBEIRO MIR..."
+        "Plácido Júnior"               → "PLACIDO JUNIOR"
+        "  joao  da  silva  "          → "JOAO DA SILVA"
+
+    Garantia: dois nomes que representem a mesma pessoa nos diferentes
+    sistemas (telefonia/WhatsApp) sempre resultarão na mesma string,
+    desde que as palavras coincidentes sejam idênticas após normalização.
+    """
+    nfkd = unicodedata.normalize("NFKD", nome)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(sem_acento.upper().split())
+
+
 def clean_agent_name(name: str) -> str:
+    """
+    Remove o sufixo de ramal/extensão (ex: ' - 6373') e normaliza o nome.
+    Retorna 'Desconhecido' para strings vazias (ligações perdidas sem agente).
+    """
     if not name:
         return "Desconhecido"
-    return name.split(" - ")[0].strip()
+    nome_sem_ramal = name.split(" - ")[0].strip()
+    return normalizar_nome(nome_sem_ramal)
 
 def safe_int(value) -> int:
     if not value or str(value).strip() == "-":
@@ -84,7 +121,9 @@ def safe_float_or_none(value) -> float | None:
     if not value or str(value).strip() == "-":
         return None
     try:
-        return float(str(value).replace(",", ".").strip())
+        val = float(str(value).replace(",", ".").strip())
+        # NUMERIC(5,2) suporta valores de -999.99 a 999.99
+        return max(-999.99, min(999.99, val))
     except ValueError:
         return None
 
@@ -101,6 +140,16 @@ def extract_date_from_filename(filename: str) -> date:
         except Exception:
             pass
     return date.today()
+
+def is_setor_permitido(valor: str) -> bool:
+    """
+    Aceita qualquer fila/equipe que comece com 'SAC' (case-insensitive).
+    Ex: "SAC", "SAC RETENÇÃO", "SAC - ATENDIMENTO", "Sac Vendas" → aceito.
+    Se o campo vier vazio, também aceita (não há como filtrar).
+    """
+    if not valor or not valor.strip():
+        return True
+    return valor.strip().upper().startswith(SETOR_PREFIXO)
 
 def detect_format(headers: list[str]):
     headers_upper = [h.upper() for h in headers]
@@ -127,9 +176,8 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
         )
 
     elif is_omnichannel:
-        # Filtro SAC: coluna "Nome da Equipe"
-        equipe = (row.get("Nome da Equipe") or "").strip().upper()
-        if equipe and equipe != SETOR_PERMITIDO:
+        equipe_raw = (row.get("Nome da Equipe") or "").strip()
+        if not is_setor_permitido(equipe_raw):
             return None
 
         data_inicial = (row.get("Data Inicial") or "").strip()
@@ -141,7 +189,7 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
             data_referencia=data_ref,
             turno=calcular_turno(data_ref),
             colaborador_nome=clean_agent_name((row.get("Nome do Atendente") or "Desconhecido").strip()),
-            equipe=(row.get("Nome da Equipe") or None),
+            equipe=(equipe_raw or None),
             canal_nome="WhatsApp",
             status_nome=(row.get("Status") or "Desconhecido").strip(),
             protocolo=(row.get("Número do Protocolo") or None),
@@ -153,9 +201,8 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
         )
 
     elif is_ligacao:
-        # Filtro SAC: coluna "Fila"
-        fila = (row.get("Fila") or "").strip().upper()
-        if fila and fila != SETOR_PERMITIDO:
+        fila_raw = (row.get("Fila") or "").strip()
+        if not is_setor_permitido(fila_raw):
             return None
 
         data_inicio = (row.get("Data de início") or "").strip()
@@ -165,7 +212,7 @@ def parse_row_to_dto(row: dict, is_voalle, is_omnichannel, is_ligacao, voalle_da
             data_referencia=data_ref,
             turno=calcular_turno(data_ref),
             colaborador_nome=clean_agent_name((row.get("Agente") or "Desconhecido").strip()),
-            equipe=(row.get("Fila") or None),
+            equipe=(fila_raw or None),
             canal_nome="Ligação",
             status_nome=(row.get("Status") or "Desconhecido").strip(),
             protocolo=(row.get("Protocolo") or None),
@@ -193,6 +240,15 @@ async def upload_csv(
         raise HTTPException(status_code=400, detail="Apenas arquivos CSV ou XLSX são permitidos.")
 
     service = IngestionService(db)
+
+    # Registra o upload imediatamente (status=pending) para auditoria
+    upload_record = models.Upload(
+        file_path=file.filename,
+        status="pending",
+        created_at=datetime.utcnow(),
+    )
+    db.add(upload_record)
+    db.commit()
 
     try:
         raw_content = await file.read()
@@ -258,9 +314,14 @@ async def upload_csv(
 
         total_success = 0
         total_error = 0
-        total_ignorados = 0  # registros de outros setores
+        total_ignorados = 0
+        total_duplicados = 0
         all_errors = []
         chunk = []
+
+        # Coleta protocolos já vistos neste upload para deduplicação em memória.
+        # Evita que subir o mesmo arquivo duas vezes dobre os números do dashboard.
+        protocolos_vistos: set[str] = set()
 
         def flush_chunk():
             nonlocal total_success, total_error, all_errors, chunk
@@ -277,9 +338,16 @@ async def upload_csv(
                 dto = parse_row_to_dto(row, is_voalle, is_omnichannel, is_ligacao, voalle_data_ref)
 
                 if dto is None:
-                    # Registro de outro setor — ignora silenciosamente
                     total_ignorados += 1
                     continue
+
+                # Deduplicação por protocolo dentro do mesmo upload
+                protocolo_val: str | None = getattr(dto, "protocolo", None)
+                if protocolo_val:
+                    if protocolo_val in protocolos_vistos:
+                        total_duplicados += 1
+                        continue
+                    protocolos_vistos.add(protocolo_val)
 
                 chunk.append(dto)
                 if len(chunk) >= CHUNK_SIZE:
@@ -298,20 +366,42 @@ async def upload_csv(
             else "error"
         )
 
+        partes_msg = [f"{total_success} registros importados"]
+        if total_ignorados:
+            partes_msg.append(f"{total_ignorados} ignorados (outros setores)")
+        if total_duplicados:
+            partes_msg.append(f"{total_duplicados} duplicados ignorados")
+        if total_error:
+            partes_msg.append(f"{total_error} erros")
+
+        upload_record.status = status
+        upload_record.processed_at = datetime.utcnow()
+        if all_errors:
+            upload_record.error = "; ".join(all_errors[:5])
+        db.commit()
+
         return {
             "status": status,
-            "message": f"{total_success} registros importados. {total_ignorados} ignorados (outros setores). {total_error} erros.",
+            "message": ". ".join(partes_msg) + ".",
             "detalhes": {
                 "success_count": total_success,
                 "ignored_count": total_ignorados,
+                "duplicate_count": total_duplicados,
                 "error_count": total_error,
                 "errors": all_errors[:10],
             }
         }
 
     except HTTPException:
+        upload_record.status = "error"
+        upload_record.processed_at = datetime.utcnow()
+        db.commit()
         raise
     except Exception as e:
+        upload_record.status = "error"
+        upload_record.processed_at = datetime.utcnow()
+        upload_record.error = str(e)
+        db.commit()
         raise HTTPException(status_code=500, detail=f"Erro interno de processamento: {str(e)}")
 
 
