@@ -26,7 +26,7 @@ origins = [
     "http://127.0.0.1:3000",
     "http://localhost:8000",
     "https://dashboard-frontend-ten-theta.vercel.app",
-    "https://https://dashboardsac.vercel.app"
+    "https://dashboardsac.vercel.app"
 ]
 
 app.add_middleware(
