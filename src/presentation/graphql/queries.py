@@ -90,6 +90,10 @@ class Query:
                     tme_omni_segundos=r["tme_omni_segundos"],
                     tma_omni_segundos=r["tma_omni_segundos"],
                     nota_omni=r["nota_omni"],
+                    voalle_clientes_atendidos=r["voalle_clientes_atendidos"],
+                    voalle_atendimentos=r["voalle_atendimentos"],
+                    voalle_finalizados=r["voalle_finalizados"],
+                    voalle_taxa_finalizacao=r["voalle_taxa_finalizacao"],
                     total_atendimentos=r["total_atendimentos"],
                     nota_final=r["nota_final"],
                 )

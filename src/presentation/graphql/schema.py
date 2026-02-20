@@ -46,6 +46,12 @@ class RankingColaboradorType:
     tma_omni_segundos: int      # Tempo Médio de Atendimento (conversa) — NOVO
     nota_omni: Optional[float]
 
+    # Voalle (produtividade ISP)
+    voalle_clientes_atendidos: int
+    voalle_atendimentos: int
+    voalle_finalizados: int
+    voalle_taxa_finalizacao: Optional[float]
+
     # Consolidado
     total_atendimentos: int
     nota_final: Optional[float]
