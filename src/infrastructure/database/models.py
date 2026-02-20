@@ -17,8 +17,30 @@ class DimColaborador(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String, nullable=False)
-    equipe = Column(String, nullable=True)
-    turno = Column(String, nullable=True)  # Turno predominante (calculado automaticamente)
+    equipe = Column(String, nullable=True)   # Ex: 'SAC', 'NOC', 'Comercial'
+    turno = Column(String, nullable=True)    # Turno predominante (calculado automaticamente)
+
+    aliases = relationship("DimColaboradorAlias", back_populates="colaborador")
+
+
+class DimColaboradorAlias(Base):
+    """
+    Mapeia nomes alternativos (de sistemas externos) para um colaborador canônico.
+
+    Exemplos de uso:
+      - Ligação truncada: "MARCIA REGINA VENTURA RODRIGUE" → MARCIA REGINA VENTURA RODRIGUES
+      - Nome distinto:    "PLACIDO PORTAL DE SOUSA JUNIOR" → PLACIDO JUNIOR
+
+    O campo alias deve ser inserido exatamente como vem do sistema externo.
+    A normalização (sem acento, maiúsculo, sem ramal) é aplicada na camada Python.
+    """
+    __tablename__ = "dim_colaborador_alias"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alias = Column(Text, nullable=False, unique=True)
+    colaborador_id = Column(Integer, ForeignKey("dim_colaboradores.id"), nullable=False, index=True)
+
+    colaborador = relationship("DimColaborador", back_populates="aliases")
 
 
 class DimCanal(Base):
@@ -45,7 +67,7 @@ class FatoAtendimento(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     data_referencia = Column(DateTime, nullable=False, index=True)
-    turno = Column(String, nullable=False, index=True)  # Calculado pelo horário do atendimento
+    turno = Column(String, nullable=False, index=True)
 
     protocolo = Column(String(100), nullable=True)
     sentido_interacao = Column(String(50), nullable=True)
@@ -66,7 +88,10 @@ class FatoAtendimento(Base):
 
 
 class FatoVoalleDiario(Base):
-    """Tabela de dados agregados de produtividade (Voalle)."""
+    """
+    Tabela de dados agregados de produtividade (Voalle).
+    Apenas colaboradores com equipe='SAC' são inseridos aqui.
+    """
     __tablename__ = "fato_voalle_diario"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -79,6 +104,7 @@ class FatoVoalleDiario(Base):
     colaborador_id = Column(Integer, ForeignKey("dim_colaboradores.id"), nullable=False, index=True)
 
     colaborador = relationship("DimColaborador")
+
 
 # ==========================================
 # AUDITORIA DE UPLOADS
