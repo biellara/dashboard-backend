@@ -8,6 +8,7 @@ from .schema import (
     MetricasConsolidadasType,
     AtendimentoPorCanalType,
     RankingColaboradorType,
+    UltimaAtualizacaoType,
     VoalleDiarioType,
     ResumoVoalleType,
     UploadHistoricoType,
@@ -38,17 +39,13 @@ class Query:
                 total_perdidas=m["total_perdidas"],
                 taxa_abandono=m["taxa_abandono"],
                 sla_percentual=m["sla_percentual"],
-                # TME — espera na fila
                 tme_ligacao_segundos=m["tme_ligacao_segundos"],
                 tme_omni_segundos=m["tme_omni_segundos"],
-                # TMA — duração da conversa
                 tma_ligacao_segundos=m["tma_ligacao_segundos"],
                 tma_omni_segundos=m["tma_omni_segundos"],
-                # Notas
                 nota_media_ligacao=m["nota_media_ligacao"],
                 nota_media_omni=m["nota_media_omni"],
                 nota_media_solucao_omni=m["nota_media_solucao_omni"],
-                # Distribuição
                 atendimentos_por_canal=[
                     AtendimentoPorCanalType(canal=c["canal"], total=c["total"])
                     for c in m["atendimentos_por_canal"]
@@ -63,16 +60,20 @@ class Query:
         data_inicio: Optional[datetime] = None,
         data_fim: Optional[datetime] = None,
         turno: Optional[str] = None,
+        colaborador_id: Optional[int] = None,
         limite: int = 50,
     ) -> List[RankingColaboradorType]:
         """
         Ranking de colaboradores com métricas separadas por canal e Nota Final.
-        Filtros opcionais: data_inicio, data_fim, turno, limite
+        Filtros opcionais: data_inicio, data_fim, turno, colaborador_id, limite.
+        Nota Final agora é composta: 70% satisfação + 30% volume normalizado.
         """
         db = SessionLocal()
         try:
             service = DashboardService(db)
-            resultados = service.get_ranking_colaboradores(data_inicio, data_fim, turno, limite)
+            resultados = service.get_ranking_colaboradores(
+                data_inicio, data_fim, turno, colaborador_id, limite
+            )
 
             return [
                 RankingColaboradorType(
@@ -99,6 +100,24 @@ class Query:
                 )
                 for r in resultados
             ]
+        finally:
+            db.close()
+
+    @strawberry.field
+    def ultima_atualizacao(self) -> UltimaAtualizacaoType:
+        """
+        Retorna a data/hora do dado mais recente de cada fonte (Omni, Ligação, Voalle).
+        Usado pelo frontend para exibir indicadores de freshness dos dados.
+        """
+        db = SessionLocal()
+        try:
+            service = DashboardService(db)
+            dados = service.get_ultima_atualizacao()
+            return UltimaAtualizacaoType(
+                omni=dados["omni"],
+                ligacao=dados["ligacao"],
+                voalle=dados["voalle"],
+            )
         finally:
             db.close()
 

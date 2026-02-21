@@ -68,64 +68,45 @@ class DashboardService:
         return round((perdidas / total) * 100, 1)
 
     def get_sla_percentual(self, data_inicio=None, data_fim=None, turno=None) -> float:
-        query = self.db.query(
-            func.count(models.FatoAtendimento.id).label("total"),
-            func.sum(case(
-                (models.FatoAtendimento.tempo_espera_segundos <= self.SLA_LIMITE_SEGUNDOS, 1),
-                else_=0
-            )).label("dentro_sla")
-        ).join(
-            models.DimStatus, models.FatoAtendimento.status_id == models.DimStatus.id
-        ).filter(models.DimStatus.nome != "Perdida")
-        query = self._filtro_base(query, data_inicio, data_fim, turno)
-        result = query.first()
-        if not result or not result.total:
+        total = self.get_total_atendimentos(data_inicio, data_fim, turno) + \
+                self.get_total_perdidas(data_inicio, data_fim, turno)
+        if total == 0:
             return 0.0
-        return round((result.dentro_sla / result.total) * 100, 1)
+        query = self.db.query(func.count(models.FatoAtendimento.id))
+        query = query.filter(
+            models.FatoAtendimento.tempo_espera_segundos <= self.SLA_LIMITE_SEGUNDOS
+        )
+        query = self._filtro_base(query, data_inicio, data_fim, turno)
+        dentro_sla = query.scalar() or 0
+        return round((dentro_sla / total) * 100, 1)
 
     # =====================================================
-    # TME — Tempo Médio de Espera (fila)
+    # TEMPOS MÉDIOS — TME (Espera) e TMA (Atendimento)
     # =====================================================
 
     def get_tme_ligacao(self, data_inicio=None, data_fim=None, turno=None) -> int:
-        """Tempo médio que o cliente aguardou na fila antes de ser atendido (Ligação)."""
         query = self.db.query(func.avg(models.FatoAtendimento.tempo_espera_segundos))
         query = self._filtro_canal(query, "Ligação")
-        query = query.join(
-            models.DimStatus, models.FatoAtendimento.status_id == models.DimStatus.id
-        ).filter(models.DimStatus.nome != "Perdida")
         query = self._filtro_base(query, data_inicio, data_fim, turno)
         result = query.scalar()
         return int(result) if result else 0
 
     def get_tme_omni(self, data_inicio=None, data_fim=None, turno=None) -> int:
-        """Tempo médio que o cliente aguardou na fila antes de ser atendido (WhatsApp)."""
         query = self.db.query(func.avg(models.FatoAtendimento.tempo_espera_segundos))
         query = self._filtro_canal(query, "WhatsApp")
         query = self._filtro_base(query, data_inicio, data_fim, turno)
         result = query.scalar()
         return int(result) if result else 0
 
-    # =====================================================
-    # TMA — Tempo Médio de Atendimento (conversa)  ← NOVO
-    # =====================================================
-
     def get_tma_ligacao(self, data_inicio=None, data_fim=None, turno=None) -> int:
-        """Tempo médio de duração da conversa/atendimento (Ligação)."""
         query = self.db.query(func.avg(models.FatoAtendimento.tempo_atendimento_segundos))
         query = self._filtro_canal(query, "Ligação")
-        query = query.join(
-            models.DimStatus, models.FatoAtendimento.status_id == models.DimStatus.id
-        ).filter(
-            models.DimStatus.nome != "Perdida",
-            models.FatoAtendimento.tempo_atendimento_segundos > 0
-        )
+        query = query.filter(models.FatoAtendimento.tempo_atendimento_segundos > 0)
         query = self._filtro_base(query, data_inicio, data_fim, turno)
         result = query.scalar()
         return int(result) if result else 0
 
     def get_tma_omni(self, data_inicio=None, data_fim=None, turno=None) -> int:
-        """Tempo médio de duração da conversa/atendimento (WhatsApp)."""
         query = self.db.query(func.avg(models.FatoAtendimento.tempo_atendimento_segundos))
         query = self._filtro_canal(query, "WhatsApp")
         query = query.filter(models.FatoAtendimento.tempo_atendimento_segundos > 0)
@@ -183,7 +164,35 @@ class DashboardService:
         return [{"canal": r.nome, "total": r.total} for r in query.all()]
 
     # =====================================================
-    # RANKING COM NOTA FINAL
+    # ÚLTIMA ATUALIZAÇÃO POR FONTE — NOVO
+    # =====================================================
+
+    def get_ultima_atualizacao(self) -> Dict:
+        """
+        Retorna a data/hora do registro mais recente de cada fonte de dados.
+        Útil para o frontend mostrar "Última atualização: há X minutos".
+        """
+        # Omnichannel (WhatsApp)
+        omni = self.db.query(func.max(models.FatoAtendimento.data_referencia)).join(
+            models.DimCanal, models.FatoAtendimento.canal_id == models.DimCanal.id
+        ).filter(models.DimCanal.nome == "WhatsApp").scalar()
+
+        # Ligação
+        ligacao = self.db.query(func.max(models.FatoAtendimento.data_referencia)).join(
+            models.DimCanal, models.FatoAtendimento.canal_id == models.DimCanal.id
+        ).filter(models.DimCanal.nome == "Ligação").scalar()
+
+        # Voalle
+        voalle = self.db.query(func.max(models.FatoVoalleDiario.data_referencia)).scalar()
+
+        return {
+            "omni": omni.isoformat() if omni else None,
+            "ligacao": ligacao.isoformat() if ligacao else None,
+            "voalle": voalle.isoformat() if voalle else None,
+        }
+
+    # =====================================================
+    # RANKING COM NOTA FINAL — CORRIGIDO (satisfação + volume)
     # =====================================================
 
     def get_ranking_colaboradores(
@@ -191,6 +200,7 @@ class DashboardService:
         data_inicio=None,
         data_fim=None,
         turno=None,
+        colaborador_id: Optional[int] = None,
         limite: int = 50,
     ) -> List[Dict]:
 
@@ -215,16 +225,10 @@ class DashboardService:
             models.DimStatus, models.FatoAtendimento.status_id == models.DimStatus.id
         ).filter(models.DimCanal.nome == "Ligação")
 
-        if data_inicio:
-            lig = lig.filter(models.FatoAtendimento.data_referencia >= data_inicio)
-        if data_fim:
-            lig = lig.filter(models.FatoAtendimento.data_referencia <= data_fim)
-        if turno:
-            lig = lig.filter(models.FatoAtendimento.turno == turno)
-
+        lig = self._filtro_base(lig, data_inicio, data_fim, turno)
         lig = lig.group_by(models.FatoAtendimento.colaborador_id).subquery()
 
-        # Sub-query Omni
+        # Sub-query Omnichannel
         omni = self.db.query(
             models.FatoAtendimento.colaborador_id.label("col_id"),
             func.count(models.FatoAtendimento.id).label("total_omni"),
@@ -237,25 +241,24 @@ class DashboardService:
             func.avg(case(
                 (and_(
                     models.FatoAtendimento.nota_solucao.isnot(None),
-                    models.FatoAtendimento.nota_atendimento.isnot(None)
+                    models.FatoAtendimento.nota_atendimento.isnot(None),
                 ),
-                (models.FatoAtendimento.nota_solucao + models.FatoAtendimento.nota_atendimento) / 2),
+                 (models.FatoAtendimento.nota_solucao + models.FatoAtendimento.nota_atendimento) / 2),
                 else_=None
             )).label("nota_omni"),
         ).join(
             models.DimCanal, models.FatoAtendimento.canal_id == models.DimCanal.id
-        ).filter(models.DimCanal.nome == "WhatsApp")
+        ).join(
+            models.DimStatus, models.FatoAtendimento.status_id == models.DimStatus.id
+        ).filter(
+            models.DimCanal.nome == "WhatsApp",
+            models.DimStatus.nome != "Perdida",
+        )
 
-        if data_inicio:
-            omni = omni.filter(models.FatoAtendimento.data_referencia >= data_inicio)
-        if data_fim:
-            omni = omni.filter(models.FatoAtendimento.data_referencia <= data_fim)
-        if turno:
-            omni = omni.filter(models.FatoAtendimento.turno == turno)
-
+        omni = self._filtro_base(omni, data_inicio, data_fim, turno)
         omni = omni.group_by(models.FatoAtendimento.colaborador_id).subquery()
 
-        # Sub-query Voalle — produtividade ISP, sem filtro de turno
+        # Sub-query Voalle — sem filtro de turno
         voalle = self.db.query(
             models.FatoVoalleDiario.colaborador_id.label("col_id"),
             func.sum(models.FatoVoalleDiario.clientes_atendidos).label("voalle_clientes"),
@@ -301,6 +304,10 @@ class DashboardService:
             | (voalle.c.voalle_atendimentos.isnot(None))
         )
 
+        # Filtro por colaborador específico (para filtro por atendente)
+        if colaborador_id:
+            query = query.filter(models.DimColaborador.id == colaborador_id)
+
         results = query.limit(limite).all()
 
         ranking = []
@@ -312,21 +319,22 @@ class DashboardService:
             nota_ligacao = round(float(r.nota_ligacao), 2) if r.nota_ligacao else None
             nota_omni = round(float(r.nota_omni), 2) if r.nota_omni else None
 
-            # Nota final ponderada pelo volume de atendimentos
-            nota_final = None
+            # Nota de SATISFAÇÃO ponderada pelo volume (como antes)
+            nota_satisfacao = None
             if nota_ligacao is not None and nota_omni is not None:
                 total_vol = ligacoes_atendidas + total_omni
                 if total_vol > 0:
-                    nota_final = round(
-                        (nota_ligacao * ligacoes_atendidas + nota_omni * total_omni) / total_vol, 2
-                    )
+                    nota_satisfacao = (nota_ligacao * ligacoes_atendidas + nota_omni * total_omni) / total_vol
             elif nota_ligacao is not None:
-                nota_final = nota_ligacao
+                nota_satisfacao = nota_ligacao
             elif nota_omni is not None:
-                nota_final = nota_omni
+                nota_satisfacao = nota_omni
 
             voalle_atend = int(r.voalle_atendimentos or 0)
             voalle_final = int(r.voalle_finalizados or 0)
+
+            # Volume total (todos os canais) — usado na normalização
+            _total_atend = ligacoes_atendidas + total_omni + voalle_atend
 
             ranking.append({
                 "colaborador_id": r.id,
@@ -351,8 +359,38 @@ class DashboardService:
                 "voalle_taxa_finalizacao": round((voalle_final / voalle_atend) * 100, 1) if voalle_atend > 0 else None,
                 # Consolidado
                 "total_atendimentos": ligacoes_atendidas + total_omni,
-                "nota_final": nota_final,
+                # Temporários para normalização (removidos após o loop)
+                "_nota_satisfacao": nota_satisfacao,
+                "_total_atend": _total_atend,
             })
+
+        # ─── Normalização por volume (NOVO) ───────────────────
+        # Transforma o volume absoluto em score 0-10 e combina
+        # com a nota de satisfação para gerar a nota_final composta.
+        #
+        # Fórmula: nota_final = satisfação × 0.7 + volume_norm × 0.3
+        # Isso garante que quem atende muito mas tem nota razoável
+        # não fique atrás de quem atende pouco com nota alta.
+        PESO_SATISFACAO = 0.7
+        PESO_VOLUME = 0.3
+
+        if ranking:
+            max_volume = max(
+                (item["_total_atend"] for item in ranking if item["_total_atend"] > 0),
+                default=1,
+            )
+
+            for item in ranking:
+                satisf = item.pop("_nota_satisfacao", None)
+                vol = item.pop("_total_atend", 0)
+
+                if satisf is not None:
+                    score_volume = (vol / max_volume) * 10 if max_volume > 0 else 0
+                    item["nota_final"] = round(
+                        satisf * PESO_SATISFACAO + score_volume * PESO_VOLUME, 2
+                    )
+                else:
+                    item["nota_final"] = None
 
         ranking.sort(key=lambda x: x["nota_final"] if x["nota_final"] is not None else -1, reverse=True)
         for i, item in enumerate(ranking, start=1):
@@ -373,7 +411,7 @@ class DashboardService:
             # TME — espera na fila
             "tme_ligacao_segundos": self.get_tme_ligacao(data_inicio, data_fim, turno),
             "tme_omni_segundos": self.get_tme_omni(data_inicio, data_fim, turno),
-            # TMA — duração da conversa (NOVO)
+            # TMA — duração da conversa
             "tma_ligacao_segundos": self.get_tma_ligacao(data_inicio, data_fim, turno),
             "tma_omni_segundos": self.get_tma_omni(data_inicio, data_fim, turno),
             # Notas
@@ -385,7 +423,7 @@ class DashboardService:
         }
 
     # =====================================================
-    # VOALLE DIÁRIO — NOVO
+    # VOALLE DIÁRIO
     # =====================================================
 
     def get_dados_voalle(
